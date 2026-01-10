@@ -15,6 +15,30 @@ This repository contains reference implementations of the DETAC (Deterministic T
 - **No floating point in hot path**: Uses Q-format fixed-point throughout (Q0.7 for activations, Q1.15 for RoPE, Q16 for exp)
 - **Minimal dependencies**: Self-contained implementations without heavy ML frameworks
 
+## Compression Benchmarks
+
+Comparison on Alice in Wonderland Chapter 1 (11,782 bytes):
+
+| Method | Size | Ratio | vs Best Traditional |
+|--------|------|-------|---------------------|
+| **CZIP (Rust)** | 3,952 | **2.98x** | baseline |
+| brotli-11 | 4,251 | 2.77x | +7.6% larger |
+| zstd-22 | 4,841 | 2.43x | +22.5% larger |
+| gzip-9 | 5,011 | 2.35x | +26.8% larger |
+
+**Speed**: ~27,000 tokens/sec encode/decode (parallel, Rust with rayon)
+
+**System**: AMD EPYC 9354 32-Core Processor, 1.1 TiB RAM
+
+### Comparison with Other Neural Compressors
+
+| Compressor | Model | Compression | Speed | Hardware |
+|------------|-------|-------------|-------|----------|
+| **CZIP** | 1-layer, 1024 vocab | 2.98x | ~27,000 tok/s | CPU |
+| [ts_zip](https://bellard.org/ts_zip/) | RWKV 169M | ~7x | ~577 tok/s | RTX 4090 GPU |
+| [llama-zip](https://github.com/alexbuz/llama-zip) | Llama 3.1 8B | 8-29x | ~30 tok/s | GPU required |
+
+
 ### Architecture
 
 ```

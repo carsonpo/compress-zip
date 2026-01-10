@@ -7,11 +7,13 @@ use compress_zip::arith_coder::{ArithDecoder, ArithEncoder};
 use compress_zip::file_format::{CompressedFile, Codec, CZIPv1OuterHeader, TOKENS_PER_CHUNK};
 use compress_zip::model::{Model, ModelWeights};
 use compress_zip::tiktoken::{load_tiktoken_json_tokenizer, load_tiktoken_json_from_bytes};
+use rayon::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -138,7 +140,7 @@ fn compress(
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
     };
 
-    let mut model = Model::new(weights);
+    let weights = Arc::new(weights);
 
     // Read input text
     println!("Reading input from {:?}...", input_path);
@@ -156,54 +158,55 @@ fn compress(
     let encode_start = Instant::now();
 
     let model_id_hash = hash_model_path(&model_path);
+
+    // Process in chunks of TOKENS_PER_CHUNK
+    let chunk_size = TOKENS_PER_CHUNK as usize;
+    let num_chunks = (num_tokens + chunk_size - 1) / chunk_size;
+
+    // Process chunks in parallel
+    let chunk_results: Vec<(Vec<u8>, u16)> = (0..num_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let chunk_start = chunk_idx * chunk_size;
+            let chunk_end = std::cmp::min(chunk_start + chunk_size, num_tokens);
+            let chunk_tokens = &tokens[chunk_start..chunk_end];
+            let is_last = chunk_idx == num_chunks - 1;
+
+            // Each thread gets its own model with fresh KV cache
+            let mut model = Model::new((*weights).clone());
+
+            let mut encoder = ArithEncoder::new();
+
+            // Encode each token in the chunk
+            for (i, &token) in chunk_tokens.iter().enumerate() {
+                let pos = i;
+                let prev_token = if i == 0 { 1022 } else { chunk_tokens[i - 1] };
+                let logits = model.forward(prev_token, pos);
+                let (cumfreqs, _total) = model.get_cumfreqs(&logits);
+                encoder.encode_symbol(&cumfreqs, token as usize);
+            }
+
+            encoder.finish();
+            let chunk_data = encoder.get_output().to_vec();
+            let last_chunk_tokens = if is_last {
+                chunk_tokens.len() as u16
+            } else {
+                TOKENS_PER_CHUNK
+            };
+
+            (chunk_data, last_chunk_tokens)
+        })
+        .collect();
+
+    // Build CompressedFile from results (must be in order)
     let mut cf = CompressedFile::new(
         model_id_hash,
         0, // tokenizer_id
         codec,
         input_bytes as u32,
     );
-
-    // Process in chunks of TOKENS_PER_CHUNK
-    let chunk_size = TOKENS_PER_CHUNK as usize;
-    let num_chunks = (num_tokens + chunk_size - 1) / chunk_size;
-
-    for chunk_idx in 0..num_chunks {
-        let chunk_start = chunk_idx * chunk_size;
-        let chunk_end = std::cmp::min(chunk_start + chunk_size, num_tokens);
-        let chunk_tokens = &tokens[chunk_start..chunk_end];
+    for (chunk_idx, (chunk_data, last_chunk_tokens)) in chunk_results.into_iter().enumerate() {
         let is_last = chunk_idx == num_chunks - 1;
-
-        // Reset model (KV cache) for each chunk - chunks are independent
-        model.reset();
-
-        let mut encoder = ArithEncoder::new();
-
-        // Encode each token in the chunk
-        for (i, &token) in chunk_tokens.iter().enumerate() {
-            // Position is within the chunk (0 to chunk_size-1), not global
-            let pos = i;
-
-            // Get model prediction (logits)
-            // First token in chunk uses BOS (1022), otherwise previous token in chunk
-            // BOS token 1022 matches the CUDA implementation
-            let prev_token = if i == 0 { 1022 } else { chunk_tokens[i - 1] };
-            let logits = model.forward(prev_token, pos);
-
-            // Convert to cumulative frequencies
-            let (cumfreqs, _total) = model.get_cumfreqs(&logits);
-
-            // Encode the actual token
-            encoder.encode_symbol(&cumfreqs, token as usize);
-        }
-
-        encoder.finish();
-        let chunk_data = encoder.get_output().to_vec();
-        let last_chunk_tokens = if is_last {
-            chunk_tokens.len() as u16
-        } else {
-            TOKENS_PER_CHUNK
-        };
-
         cf.add_chunk(chunk_data, is_last, last_chunk_tokens);
     }
 
@@ -285,7 +288,7 @@ fn decompress(
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
     };
 
-    let mut model = Model::new(weights);
+    let weights = Arc::new(weights);
 
     // Read compressed file
     println!("Reading compressed file from {:?}...", input_path);
@@ -317,45 +320,42 @@ fn decompress(
     let cf = CompressedFile::read_from_decompressed(outer_header, &payload)?;
 
     let num_tokens = cf.get_total_tokens() as usize;
-    println!("  {} chunks, {} tokens total", cf.inner_header.chunk_count, num_tokens);
+    let num_chunks = cf.inner_header.chunk_count as usize;
+    println!("  {} chunks, {} tokens total", num_chunks, num_tokens);
 
     // Decompress
     println!("Decompressing...");
     let decode_start = Instant::now();
 
-    let mut all_tokens: Vec<u32> = Vec::with_capacity(num_tokens);
+    // Prepare chunk info for parallel processing
+    let chunk_info: Vec<(Vec<u8>, usize)> = cf.chunks.iter().enumerate()
+        .map(|(idx, chunk)| (chunk.data.clone(), cf.get_chunk_tokens(idx) as usize))
+        .collect();
 
-    for (chunk_idx, chunk) in cf.chunks.iter().enumerate() {
-        let chunk_token_count = cf.get_chunk_tokens(chunk_idx) as usize;
-        let mut decoder = ArithDecoder::new(chunk.data.clone());
+    // Process chunks in parallel
+    let all_chunk_tokens: Vec<Vec<u32>> = chunk_info
+        .into_par_iter()
+        .map(|(chunk_data, chunk_token_count)| {
+            // Each thread gets its own model with fresh KV cache
+            let mut model = Model::new((*weights).clone());
+            let mut decoder = ArithDecoder::new(chunk_data);
+            let mut chunk_decoded: Vec<u32> = Vec::with_capacity(chunk_token_count);
 
-        // Reset model (KV cache) for each chunk - chunks are independent
-        model.reset();
+            for i in 0..chunk_token_count {
+                let pos = i;
+                let prev_token = if i == 0 { 1022 } else { chunk_decoded[i - 1] };
+                let logits = model.forward(prev_token, pos);
+                let (cumfreqs, _total) = model.get_cumfreqs(&logits);
+                let token = decoder.decode_symbol(&cumfreqs) as u32;
+                chunk_decoded.push(token);
+            }
 
-        // Tokens decoded in this chunk (for prev_token lookup)
-        let mut chunk_decoded: Vec<u32> = Vec::with_capacity(chunk_token_count);
+            chunk_decoded
+        })
+        .collect();
 
-        for i in 0..chunk_token_count {
-            // Position is within the chunk (0 to chunk_size-1), not global
-            let pos = i;
-
-            // Get model prediction
-            // First token in chunk uses BOS (1022), otherwise previous token in this chunk
-            // BOS token 1022 matches the CUDA implementation
-            let prev_token = if i == 0 { 1022 } else { chunk_decoded[i - 1] };
-            let logits = model.forward(prev_token, pos);
-
-            // Convert to cumulative frequencies
-            let (cumfreqs, _total) = model.get_cumfreqs(&logits);
-
-            // Decode token
-            let token = decoder.decode_symbol(&cumfreqs) as u32;
-            chunk_decoded.push(token);
-        }
-
-        // Add all tokens from this chunk to the full list
-        all_tokens.extend_from_slice(&chunk_decoded);
-    }
+    // Flatten results (already in order due to par_iter preserving order)
+    let all_tokens: Vec<u32> = all_chunk_tokens.into_iter().flatten().collect();
 
     let decode_time = decode_start.elapsed();
 

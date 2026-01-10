@@ -16,7 +16,7 @@ use crate::softmax_cdf::{build_cumfreqs, compute_coef_q24_for_acc, compute_targe
 use std::path::Path;
 
 /// Model configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ModelConfig {
     pub vocab_size: usize,
     pub n_layers: usize,
@@ -46,6 +46,7 @@ impl Default for ModelConfig {
 }
 
 /// Transformer layer weights (czip-model-v1 integer-only format)
+#[derive(Clone)]
 pub struct LayerWeights {
     // Pre-attention norm (Q0.7 int8 - matches CUDA)
     pub attn_norm: Vec<i8>,         // [d_model]
@@ -79,6 +80,7 @@ pub struct LayerWeights {
 }
 
 /// Full model weights (czip-model-v1 integer-only format)
+#[derive(Clone)]
 pub struct ModelWeights {
     pub config: ModelConfig,
     pub embedding: Vec<i8>,         // [vocab_size, d_model]
