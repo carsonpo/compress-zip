@@ -147,6 +147,49 @@ def div_rne_tte_s32(numerator: int, divisor: int) -> int:
     return -quotient if neg else quotient
 
 
+def div_rne_tte_s64_to_s32(numerator: int, denominator: int) -> int:
+    """
+    Signed 64-bit division with round-to-nearest, ties-to-even.
+    Returns result clamped to int32 range.
+
+    Matches CUDA div_round_nearest_s64_to_s32 in attention.cu.
+
+    Args:
+        numerator: Signed 64-bit numerator
+        denominator: Unsigned 64-bit denominator (must be != 0)
+
+    Returns:
+        Rounded quotient clamped to int32 range [-2^31, 2^31-1]
+    """
+    if denominator == 0:
+        return 0
+
+    sign = -1 if numerator < 0 else 1
+    a = abs(numerator)
+    den = denominator
+
+    q = a // den
+    r = a - q * den
+
+    # Round: if 2*r > den, round up; if 2*r == den, tie to even
+    if (r << 1) > den:
+        q += 1
+    elif (r << 1) == den:
+        q += (q & 1)  # ties-to-even
+
+    out = q * sign
+
+    # Clamp to int32 range
+    INT32_MAX = 0x7FFFFFFF
+    INT32_MIN = -0x80000000
+    if out > INT32_MAX:
+        out = INT32_MAX
+    if out < INT32_MIN:
+        out = INT32_MIN
+
+    return out
+
+
 def isqrt32_restoring(x: int) -> int:
     """
     Integer square root using restoring algorithm.
@@ -182,15 +225,16 @@ def isqrt32_restoring(x: int) -> int:
 
 def clamp_i8(x: int) -> int:
     """
-    Clamp value to signed 8-bit range [-128, 127].
+    Clamp value to symmetric int8 range [-127, 127].
+    Matches CUDA: max(-127, min(127, x))
 
     Args:
         x: Integer value
 
     Returns:
-        Value clamped to i8 range
+        Value clamped to symmetric i8 range
     """
-    return max(-128, min(127, x))
+    return max(-127, min(127, x))
 
 
 def argmax_deterministic(values: Sequence[int]) -> int:
@@ -245,8 +289,8 @@ def sra_rne_tte_s32_np(x: np.ndarray, shift: int) -> np.ndarray:
 
 
 def clamp_i8_np(x: np.ndarray) -> np.ndarray:
-    """Vectorized clamp to i8 range."""
-    return np.clip(x, -128, 127).astype(np.int8)
+    """Vectorized clamp to symmetric i8 range [-127, 127] matching CUDA."""
+    return np.clip(x, -127, 127).astype(np.int8)
 
 
 # Test cases

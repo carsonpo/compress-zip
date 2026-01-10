@@ -17,6 +17,7 @@ from .attention import gqa_attention_mqa_i8, KVCache
 from .softmax_cdf import build_cumfreqs
 from .arith_coder import ArithEncoder, ArithDecoder
 from .file_format import CZIPv1OuterHeader, CZIPv1InnerHeader, CompressedFile, Codec
+from .model import Model, ModelConfig, ModelWeights
 
 __all__ = [
     # primitives
@@ -51,4 +52,8 @@ __all__ = [
     "CZIPv1InnerHeader",
     "CompressedFile",
     "Codec",
+    # model
+    "Model",
+    "ModelConfig",
+    "ModelWeights",
 ]

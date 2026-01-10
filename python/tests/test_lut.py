@@ -1,4 +1,8 @@
-"""Tests for look-up tables."""
+"""Tests for look-up tables.
+
+Updated to match CUDA softmax_cumfreq.cu which uses NEGATIVE exponent:
+exp2_lut[i] = round(2^(-i/256) * 65536)
+"""
 
 import pytest
 import numpy as np
@@ -17,7 +21,7 @@ from compress_zip.lut import (
 
 
 class TestExp2LutQ16:
-    """Tests for exp2 look-up table."""
+    """Tests for exp2 look-up table (NEGATIVE exponent matching CUDA)."""
 
     def test_table_size(self):
         """Table should have 256 entries."""
@@ -25,27 +29,30 @@ class TestExp2LutQ16:
         assert len(lut.table) == 256
 
     def test_first_entry(self):
-        """First entry is 2^0 = 1.0 in Q16."""
+        """First entry is 2^(-0) = 1.0, clamped to 65535."""
         lut = Exp2LutQ16()
-        assert lut[0] == EXP_Q16_SCALE  # 65536
+        # 2^(-0) * 65536 = 65536, clamped to 65535
+        assert lut[0] == 65535
 
     def test_midpoint(self):
-        """Entry 128 is 2^0.5 = sqrt(2) in Q16."""
+        """Entry 128 is 2^(-0.5) = 1/sqrt(2) in Q16."""
         lut = Exp2LutQ16()
-        expected = int(round(math.sqrt(2) * EXP_Q16_SCALE))
+        # 2^(-0.5) = 1/sqrt(2) ≈ 0.7071
+        expected = int(round(math.pow(2, -0.5) * EXP_Q16_SCALE))
         assert abs(lut[128] - expected) <= 1
 
     def test_last_entry(self):
-        """Entry 255 is 2^(255/256) in Q16."""
+        """Entry 255 is 2^(-255/256) in Q16."""
         lut = Exp2LutQ16()
-        expected = int(round(math.pow(2, 255/256) * EXP_Q16_SCALE))
+        # 2^(-255/256) ≈ 0.5027
+        expected = int(round(math.pow(2, -255/256) * EXP_Q16_SCALE))
         assert abs(lut[255] - expected) <= 1
 
-    def test_monotonically_increasing(self):
-        """Table values should be monotonically increasing."""
+    def test_monotonically_decreasing(self):
+        """Table values should be monotonically decreasing (negative exponent)."""
         lut = Exp2LutQ16()
         for i in range(255):
-            assert lut[i] <= lut[i + 1]
+            assert lut[i] >= lut[i + 1], f"Table not decreasing at {i}"
 
     def test_indexing_wraps(self):
         """Index should wrap with & 0xFF."""
@@ -91,25 +98,25 @@ class TestRopeLut:
 
 
 class TestExpQ16FromNegFixed:
-    """Tests for exp2(-x) computation."""
+    """Tests for exp2(-x) computation with negative exponent LUT."""
 
     def test_zero_exponent(self):
-        """2^(-0) = 1."""
+        """2^(-0) = 1 -> lut[0] = 65535."""
         lut = get_exp2_lut()
         result = exp_q16_from_neg_fixed(0, lut)
-        assert result == EXP_Q16_SCALE
+        assert result == 65535  # lut[0] >> 0
 
     def test_one_exponent(self):
-        """2^(-1) = 0.5 -> 32768 in Q16."""
+        """For neg_x_q8=256 (1.0): int_part=1, frac_part=0 -> lut[0] >> 1 = 32767."""
         lut = get_exp2_lut()
-        result = exp_q16_from_neg_fixed(256, lut)  # 256 in Q8 = 1.0
-        assert result == 32768
+        result = exp_q16_from_neg_fixed(256, lut)
+        assert result == 32767  # 65535 >> 1
 
     def test_two_exponent(self):
-        """2^(-2) = 0.25 -> 16384 in Q16."""
+        """For neg_x_q8=512 (2.0): int_part=2, frac_part=0 -> lut[0] >> 2 = 16383."""
         lut = get_exp2_lut()
-        result = exp_q16_from_neg_fixed(512, lut)  # 512 in Q8 = 2.0
-        assert result == 16384
+        result = exp_q16_from_neg_fixed(512, lut)
+        assert result == 16383  # 65535 >> 2
 
     def test_large_exponent_underflows(self):
         """Large exponents should underflow to 0."""
@@ -122,10 +129,9 @@ class TestExpQ16FromNegFixed:
         lut = get_exp2_lut()
         # For neg_x_q8=128 (0.5 in Q8 format):
         # int_part = 128 >> 8 = 0, frac_part = 128
-        # result = lut[128] >> 0 = 2^(128/256) * 65536 = sqrt(2) * 65536
-        # This is used with additional scaling in softmax
+        # result = lut[128] >> 0 = 2^(-128/256) * 65536 = 2^(-0.5) * 65536
         result = exp_q16_from_neg_fixed(128, lut)
-        expected_lut_value = int(round(math.sqrt(2) * EXP_Q16_SCALE))
+        expected_lut_value = int(round(math.pow(2, -0.5) * EXP_Q16_SCALE))
         assert abs(result - expected_lut_value) <= 1
 
 
@@ -145,13 +151,13 @@ class TestSingletons:
         assert lut1 is lut2
 
 
-# Cross-verification vectors
+# Cross-verification vectors for negative exponent LUT
 EXP_CROSS_VERIFICATION_VECTORS = [
     # (neg_x_q8, expected_result)
-    (0, 65536),      # 2^0 = 1
-    (256, 32768),    # 2^(-1) = 0.5
-    (512, 16384),    # 2^(-2) = 0.25
-    (768, 8192),     # 2^(-3) = 0.125
+    (0, 65535),      # 2^(-0) via lut[0] >> 0 = 65535
+    (256, 32767),    # 2^(-1) via lut[0] >> 1 = 32767
+    (512, 16383),    # 2^(-2) via lut[0] >> 2 = 16383
+    (768, 8191),     # 2^(-3) via lut[0] >> 3 = 8191
 ]
 
 

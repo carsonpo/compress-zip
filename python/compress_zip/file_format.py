@@ -215,7 +215,10 @@ def decompress_payload(data: bytes, codec: Codec) -> bytes:
         if not HAS_ZSTD:
             raise RuntimeError("zstandard library not installed")
         dctx = zstd.ZstdDecompressor()
-        return dctx.decompress(data)
+        # Use stream reader for compatibility with frames without content size
+        # (e.g., from Rust's zstd crate which uses streaming API)
+        with dctx.stream_reader(data) as reader:
+            return reader.read()
     elif codec == Codec.BROTLI:
         if not HAS_BROTLI:
             raise RuntimeError("brotli library not installed")

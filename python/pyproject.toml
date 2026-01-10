@@ -15,6 +15,13 @@ dev = [
     "pytest>=7.0.0",
     "pytest-xdist>=3.0.0",
 ]
+compression = [
+    "zstandard>=0.21.0",
+    "brotli>=1.1.0",
+]
+
+[project.scripts]
+compress-zip = "compress_zip.__main__:main"
 
 [build-system]
 requires = ["hatchling"]

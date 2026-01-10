@@ -53,16 +53,20 @@ class ArithEncoder:
         """
         Encode a single symbol.
 
+        Matches CUDA arith_cuda.cu inclusive cumsum format.
+
         Args:
-            cumfreqs: Cumulative frequency table [vocab_size + 1]
+            cumfreqs: Cumulative frequency table [vocab_size] (inclusive cumsum)
             symbol: Symbol index to encode (0 to vocab_size - 1)
             total: Total frequency (cumfreqs[-1])
         """
         range_size = self.high - self.low + 1
 
-        # Update range based on symbol
-        sym_low = int(cumfreqs[symbol])
-        sym_high = int(cumfreqs[symbol + 1])
+        # Update range based on symbol (CUDA-matching inclusive format)
+        # sym_low = cumfreqs[symbol - 1] if symbol > 0 else 0
+        # sym_high = cumfreqs[symbol]
+        sym_high = int(cumfreqs[symbol])
+        sym_low = int(cumfreqs[symbol - 1]) if symbol > 0 else 0
 
         # new_high = low + (range * sym_high / total) - 1
         # new_low = low + (range * sym_low / total)
@@ -97,28 +101,23 @@ class ArithEncoder:
         """
         Finish encoding and return compressed bytes.
 
-        Must output enough bits to uniquely identify the final range.
+        Matches CUDA arith_encode_finish_kernel: emits a single '1' bit as terminator.
         """
-        # Output bits to narrow down the final range
-        self.pending_bits += 1
-        if self.low < QUARTER_RANGE:
-            self._output_bit_with_pending(0)
-        else:
-            self._output_bit_with_pending(1)
+        # Emit a fixed '1' bit as terminator (matching CUDA)
+        self._output_bit(1)
 
-        # Pad to byte boundary
-        while len(self.output_bits) % 8 != 0:
-            self.output_bits.append(0)
+        # Flush partial byte if any bits written
+        if len(self.output_bits) % 8 != 0:
+            # Pad remaining bits in current byte with zeros
+            while len(self.output_bits) % 8 != 0:
+                self.output_bits.append(0)
 
         # Convert bits to bytes (MSB first)
         result = bytearray()
         for i in range(0, len(self.output_bits), 8):
             byte = 0
             for j in range(8):
-                if i + j < len(self.output_bits):
-                    byte = (byte << 1) | self.output_bits[i + j]
-                else:
-                    byte = byte << 1
+                byte = (byte << 1) | self.output_bits[i + j]
             result.append(byte)
 
         return bytes(result)
@@ -157,8 +156,10 @@ class ArithDecoder:
         """
         Decode a single symbol.
 
+        Matches CUDA arith_cuda.cu inclusive cumsum format.
+
         Args:
-            cumfreqs: Cumulative frequency table [vocab_size + 1]
+            cumfreqs: Cumulative frequency table [vocab_size] (inclusive cumsum)
             total: Total frequency (cumfreqs[-1])
 
         Returns:
@@ -170,19 +171,21 @@ class ArithDecoder:
         # scaled_value = ((value - low + 1) * total - 1) / range
         scaled = ((self.value - self.low + 1) * total - 1) // range_size
 
-        # Binary search for symbol
-        vocab_size = len(cumfreqs) - 1
+        # Binary search for symbol (CUDA-matching inclusive format)
+        # For inclusive cumsum: symbol k spans [cumfreqs[k-1], cumfreqs[k])
+        # where cumfreqs[-1] = 0 by convention
+        vocab_size = len(cumfreqs)
         symbol = 0
         for i in range(vocab_size):
-            if cumfreqs[i + 1] > scaled:
+            if cumfreqs[i] > scaled:
                 symbol = i
                 break
         else:
             symbol = vocab_size - 1
 
-        # Update range
-        sym_low = int(cumfreqs[symbol])
-        sym_high = int(cumfreqs[symbol + 1])
+        # Update range (CUDA-matching inclusive format)
+        sym_high = int(cumfreqs[symbol])
+        sym_low = int(cumfreqs[symbol - 1]) if symbol > 0 else 0
 
         self.high = self.low + (range_size * sym_high // total) - 1
         self.low = self.low + (range_size * sym_low // total)
@@ -236,13 +239,13 @@ def decode_symbols(data: bytes, cumfreqs: np.ndarray, total: int, num_symbols: i
 if __name__ == "__main__":
     # Test basic encode/decode roundtrip
     # Simple frequency table: 4 symbols with frequencies [1, 2, 3, 4]
-    freqs = np.array([1, 2, 3, 4], dtype=np.int32)
-    cumfreqs = np.zeros(5, dtype=np.int32)
-    cumfreqs[1:] = np.cumsum(freqs)
+    # Using CUDA-matching inclusive cumsum format (no leading 0)
+    freqs = np.array([1, 2, 3, 4], dtype=np.uint32)
+    cumfreqs = np.cumsum(freqs).astype(np.uint32)  # Inclusive: [1, 3, 6, 10]
     total = int(cumfreqs[-1])
 
     print(f"Frequencies: {freqs}")
-    print(f"Cumfreqs: {cumfreqs}")
+    print(f"Cumfreqs (inclusive): {cumfreqs}")
     print(f"Total: {total}")
 
     # Encode some symbols
@@ -260,13 +263,12 @@ if __name__ == "__main__":
 
     # Test with larger vocabulary
     vocab_size = 100
-    freqs_large = np.random.randint(1, 100, vocab_size, dtype=np.int32)
-    cumfreqs_large = np.zeros(vocab_size + 1, dtype=np.int32)
-    cumfreqs_large[1:] = np.cumsum(freqs_large)
+    np.random.seed(42)
+    freqs_large = np.random.randint(1, 100, vocab_size, dtype=np.uint32)
+    cumfreqs_large = np.cumsum(freqs_large).astype(np.uint32)  # Inclusive
     total_large = int(cumfreqs_large[-1])
 
     # Generate random symbols
-    np.random.seed(42)
     original_large = [int(np.random.randint(0, vocab_size)) for _ in range(1000)]
 
     encoded_large = encode_symbols(original_large, cumfreqs_large, total_large)

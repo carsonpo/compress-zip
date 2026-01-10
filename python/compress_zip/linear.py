@@ -18,15 +18,17 @@ def linear_i8_to_i32(
     Computes y = x @ weight.T + bias
 
     Args:
-        x: Input tensor of shape [batch, in_features] as int8
+        x: Input tensor of shape [in_features] or [batch, in_features] as int8
         weight: Weight tensor of shape [out_features, in_features] as int8
         bias: Optional bias tensor of shape [out_features] as int32
 
     Returns:
-        Output tensor of shape [batch, out_features] as int32 accumulators
+        Output tensor of shape [out_features] or [batch, out_features] as int32 accumulators
     """
+    squeeze = False
     if x.ndim == 1:
         x = x.reshape(1, -1)
+        squeeze = True
 
     batch_size, in_features = x.shape
     out_features, weight_in = weight.shape
@@ -51,6 +53,8 @@ def linear_i8_to_i32(
     if bias is not None:
         output += bias.astype(np.int32)
 
+    if squeeze:
+        return output[0]
     return output
 
 
@@ -62,8 +66,10 @@ def linear_i8_to_i32_vectorized(
     """
     Vectorized int8 linear layer (faster, bit-exact for integer ops).
     """
+    squeeze = False
     if x.ndim == 1:
         x = x.reshape(1, -1)
+        squeeze = True
 
     # Convert to int32 for accumulation
     x_i32 = x.astype(np.int32)
@@ -76,6 +82,8 @@ def linear_i8_to_i32_vectorized(
     if bias is not None:
         output += bias.astype(np.int32)
 
+    if squeeze:
+        return output[0]
     return output
 
 

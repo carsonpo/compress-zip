@@ -16,8 +16,8 @@ class TestArithmeticCoder:
     def test_simple_roundtrip(self):
         """Basic encode/decode roundtrip."""
         freqs = np.array([1, 2, 3, 4], dtype=np.int32)
-        cumfreqs = np.zeros(5, dtype=np.int32)
-        cumfreqs[1:] = np.cumsum(freqs)
+        # Use inclusive cumsum (CUDA format, no leading 0)
+        cumfreqs = np.cumsum(freqs).astype(np.uint32)
         total = int(cumfreqs[-1])
 
         original = [0, 1, 2, 3, 3, 2, 1, 0]
@@ -30,8 +30,8 @@ class TestArithmeticCoder:
         """Test with uniform distribution."""
         vocab_size = 16
         freqs = np.ones(vocab_size, dtype=np.int32)
-        cumfreqs = np.zeros(vocab_size + 1, dtype=np.int32)
-        cumfreqs[1:] = np.cumsum(freqs)
+        # Use inclusive cumsum (CUDA format, no leading 0)
+        cumfreqs = np.cumsum(freqs).astype(np.uint32)
         total = int(cumfreqs[-1])
 
         original = list(range(vocab_size)) * 10
@@ -43,8 +43,8 @@ class TestArithmeticCoder:
     def test_skewed_distribution(self):
         """Test with highly skewed distribution."""
         freqs = np.array([1000, 1, 1, 1, 1], dtype=np.int32)
-        cumfreqs = np.zeros(6, dtype=np.int32)
-        cumfreqs[1:] = np.cumsum(freqs)
+        # Use inclusive cumsum (CUDA format, no leading 0)
+        cumfreqs = np.cumsum(freqs).astype(np.uint32)
         total = int(cumfreqs[-1])
 
         # Mostly symbol 0
@@ -59,8 +59,8 @@ class TestArithmeticCoder:
         vocab_size = 256
         np.random.seed(42)
         freqs = np.random.randint(1, 100, vocab_size, dtype=np.int32)
-        cumfreqs = np.zeros(vocab_size + 1, dtype=np.int32)
-        cumfreqs[1:] = np.cumsum(freqs)
+        # Use inclusive cumsum (CUDA format, no leading 0)
+        cumfreqs = np.cumsum(freqs).astype(np.uint32)
         total = int(cumfreqs[-1])
 
         original = [int(np.random.randint(0, vocab_size)) for _ in range(500)]
@@ -72,8 +72,8 @@ class TestArithmeticCoder:
     def test_single_symbol(self):
         """Test encoding a single symbol."""
         freqs = np.array([1, 1], dtype=np.int32)
-        cumfreqs = np.zeros(3, dtype=np.int32)
-        cumfreqs[1:] = np.cumsum(freqs)
+        # Use inclusive cumsum (CUDA format, no leading 0)
+        cumfreqs = np.cumsum(freqs).astype(np.uint32)
         total = int(cumfreqs[-1])
 
         for sym in [0, 1]:
@@ -85,8 +85,8 @@ class TestArithmeticCoder:
         """Verify compression is reasonable."""
         # Highly skewed: symbol 0 very likely
         freqs = np.array([10000, 1, 1, 1], dtype=np.int32)
-        cumfreqs = np.zeros(5, dtype=np.int32)
-        cumfreqs[1:] = np.cumsum(freqs)
+        # Use inclusive cumsum (CUDA format, no leading 0)
+        cumfreqs = np.cumsum(freqs).astype(np.uint32)
         total = int(cumfreqs[-1])
 
         # All symbol 0
@@ -99,8 +99,8 @@ class TestArithmeticCoder:
     def test_empty_sequence(self):
         """Test empty sequence."""
         freqs = np.array([1, 1], dtype=np.int32)
-        cumfreqs = np.zeros(3, dtype=np.int32)
-        cumfreqs[1:] = np.cumsum(freqs)
+        # Use inclusive cumsum (CUDA format, no leading 0)
+        cumfreqs = np.cumsum(freqs).astype(np.uint32)
         total = int(cumfreqs[-1])
 
         original = []
@@ -116,8 +116,8 @@ class TestArithEncoderState:
     def test_encoder_state_progression(self):
         """Verify encoder state changes after each symbol."""
         freqs = np.array([1, 1], dtype=np.int32)
-        cumfreqs = np.zeros(3, dtype=np.int32)
-        cumfreqs[1:] = np.cumsum(freqs)
+        # Use inclusive cumsum (CUDA format, no leading 0)
+        cumfreqs = np.cumsum(freqs).astype(np.uint32)
         total = int(cumfreqs[-1])
 
         encoder = ArithEncoder()
@@ -154,8 +154,8 @@ class TestArithCrossVerification:
     def test_roundtrip(self, freqs, symbols):
         """Verify roundtrip works for cross-verification vectors."""
         freqs = np.array(freqs, dtype=np.int32)
-        cumfreqs = np.zeros(len(freqs) + 1, dtype=np.int32)
-        cumfreqs[1:] = np.cumsum(freqs)
+        # Use inclusive cumsum (CUDA format, no leading 0)
+        cumfreqs = np.cumsum(freqs).astype(np.uint32)
         total = int(cumfreqs[-1])
 
         encoded = encode_symbols(symbols, cumfreqs, total)

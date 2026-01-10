@@ -3,7 +3,7 @@
 //! Matches the CUDA implementation in attention.cu.
 
 use crate::linear::linear_i8_to_i32;
-use crate::lut::{exp_q16_from_neg_fixed, Exp2LutQ16, RopeLut, ROPE_HALF_DIM, ROPE_HEAD_DIM};
+use crate::lut::{exp_q16_from_neg_fixed_with_coef, Exp2LutQ16, RopeLut, ROPE_HALF_DIM, ROPE_HEAD_DIM};
 use crate::primitives::{clamp_i8, div_rne_tte_s64_to_s32, sra_rne_tte_s32, sra_rne_tte_s64_to_s32};
 
 /// Constants for attention
@@ -225,18 +225,20 @@ pub fn gqa_attention_mqa_i8(
                     // New max found - need to rescale
                     if m != i32::MIN {
                         let diff = m - score;
-                        let scale_old = exp_q16_from_neg_fixed(diff, exp_lut, ATTN_COEF_Q24);
+                        let scale_old = exp_q16_from_neg_fixed_with_coef(diff, exp_lut, ATTN_COEF_Q24);
                         // Rescale S
                         s = (s * scale_old as u64 + 0x8000) >> 16;
-                        // Rescale vacc
+                        // Rescale vacc - must match CUDA exactly
+                        // CUDA: prod += (prod >= 0) ? (1LL << 15) : -(1LL << 15); vacc = prod >> 16;
                         for v in vacc.iter_mut() {
                             let prod = (*v) * (scale_old as i64);
-                            // Symmetric rounding for determinism
-                            *v = if prod >= 0 {
-                                (prod + (1i64 << 15)) >> 16
+                            // Match CUDA's rounding: add/subtract half then arithmetic shift
+                            let adjusted = if prod >= 0 {
+                                prod + (1i64 << 15)
                             } else {
-                                -((-prod + (1i64 << 15)) >> 16)
+                                prod - (1i64 << 15)
                             };
+                            *v = adjusted >> 16;
                         }
                     }
                     m = score;
@@ -244,7 +246,7 @@ pub fn gqa_attention_mqa_i8(
 
                 // Compute exp weight for this token
                 let diff = score - m;
-                let w = exp_q16_from_neg_fixed(diff, exp_lut, ATTN_COEF_Q24);
+                let w = exp_q16_from_neg_fixed_with_coef(diff, exp_lut, ATTN_COEF_Q24);
                 s += w as u64;
 
                 // Accumulate weighted V

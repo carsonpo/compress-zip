@@ -16,13 +16,15 @@ const SAFETENSORS_MAX_METADATA_SIZE: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
+    Int8,
+    Int16,
     Int32,
     Int64,
+    UInt8,
+    UInt16,
     FP16,
     BF16,
     FP32,
-    UInt8,
-    Int8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,19 +35,22 @@ pub enum Device {
 impl DType {
     pub fn size_in_bytes(&self) -> usize {
         match self {
+            DType::Int8 => 1,
+            DType::Int16 => 2,
             DType::Int32 => 4,
             DType::Int64 => 8,
+            DType::UInt8 => 1,
+            DType::UInt16 => 2,
             DType::FP16 => 2,
             DType::BF16 => 2,
             DType::FP32 => 4,
-            DType::UInt8 => 1,
-            DType::Int8 => 1,
         }
     }
 }
 
 pub struct Tensor {
-    data: Vec<f16>,
+    /// Raw data stored as bytes
+    data: Vec<u8>,
     shape: Vec<usize>,
     dtype: DType,
     device: Device,
@@ -53,20 +58,22 @@ pub struct Tensor {
 
 impl Tensor {
     pub fn new(shape: Vec<usize>, dtype: DType, device: Device) -> Self {
+        let num_elements: usize = shape.iter().product();
+        let byte_size = num_elements * dtype.size_in_bytes();
         Self {
-            data: vec![f16::from_f32(0.0); shape.iter().product()],
+            data: vec![0u8; byte_size],
             shape,
             dtype,
             device,
         }
     }
 
-    pub fn get_data_ptr(&self) -> *const f16 {
+    pub fn get_data_ptr(&self) -> *const u8 {
         self.data.as_ptr()
     }
 
-    pub fn get_data_ptr_const(&self) -> *const f16 {
-        self.data.as_ptr()
+    pub fn get_data_ptr_mut(&mut self) -> *mut u8 {
+        self.data.as_mut_ptr()
     }
 
     pub fn shape(&self) -> &[usize] {
@@ -81,21 +88,64 @@ impl Tensor {
         self.device
     }
 
-    pub fn from_vec(data: Vec<f16>, shape: Vec<usize>, dtype: DType) -> Self {
-        Self {
-            data,
-            shape,
-            dtype,
-            device: Device::CPU,
-        }
+    pub fn num_elements(&self) -> usize {
+        self.shape.iter().product()
     }
 
-    pub fn as_ref(&self) -> &[f16] {
+    /// Get data as i8 slice (only valid for Int8 dtype)
+    pub fn as_i8(&self) -> &[i8] {
+        assert_eq!(self.dtype, DType::Int8);
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const i8, self.num_elements()) }
+    }
+
+    /// Get data as u8 slice (only valid for UInt8 dtype)
+    pub fn as_u8(&self) -> &[u8] {
+        assert!(self.dtype == DType::UInt8);
         &self.data
     }
 
+    /// Get data as i16 slice (only valid for Int16 dtype)
+    pub fn as_i16(&self) -> &[i16] {
+        assert_eq!(self.dtype, DType::Int16);
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const i16, self.num_elements()) }
+    }
+
+    /// Get data as u16 slice (only valid for UInt16 dtype)
+    pub fn as_u16(&self) -> &[u16] {
+        assert_eq!(self.dtype, DType::UInt16);
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const u16, self.num_elements()) }
+    }
+
+    /// Get data as i32 slice (only valid for Int32 dtype)
+    pub fn as_i32(&self) -> &[i32] {
+        assert_eq!(self.dtype, DType::Int32);
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const i32, self.num_elements()) }
+    }
+
+    /// Get data as f16 slice (only valid for FP16 dtype)
+    pub fn as_f16(&self) -> &[f16] {
+        assert_eq!(self.dtype, DType::FP16);
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const f16, self.num_elements()) }
+    }
+
+    /// Get data as f32 slice (only valid for FP32 dtype)
+    pub fn as_f32(&self) -> &[f32] {
+        assert_eq!(self.dtype, DType::FP32);
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const f32, self.num_elements()) }
+    }
+
+    // Legacy methods for backwards compatibility
+    pub fn as_ref(&self) -> &[f16] {
+        // Only works for FP16 tensors
+        if self.dtype == DType::FP16 {
+            self.as_f16()
+        } else {
+            panic!("as_ref() called on non-FP16 tensor (dtype={:?}). Use typed accessor.", self.dtype);
+        }
+    }
+
     pub fn to_vec(&self) -> Vec<f16> {
-        self.data.clone()
+        self.as_ref().to_vec()
     }
 }
 
@@ -154,13 +204,15 @@ struct TensorInfo {
 // Helper functions
 fn get_tensor_dtype(dtype_str: &str) -> Result<DType> {
     match dtype_str {
+        "I8" => Ok(DType::Int8),
+        "I16" => Ok(DType::Int16),
         "BOOL" | "I32" => Ok(DType::Int32),
         "I64" => Ok(DType::Int64),
+        "U8" => Ok(DType::UInt8),
+        "U16" => Ok(DType::UInt16),
         "F16" => Ok(DType::FP16),
         "BF16" => Ok(DType::BF16),
         "F32" => Ok(DType::FP32),
-        "U8" => Ok(DType::UInt8),
-        "I8" => Ok(DType::Int8),
         _ => Err(SafetensorsError::Custom(format!(
             "Unknown dtype: {}",
             dtype_str
@@ -170,13 +222,15 @@ fn get_tensor_dtype(dtype_str: &str) -> Result<DType> {
 
 fn get_safetensors_dtype(dtype: DType) -> Result<&'static str> {
     match dtype {
+        DType::Int8 => Ok("I8"),
+        DType::Int16 => Ok("I16"),
         DType::Int32 => Ok("I32"),
         DType::Int64 => Ok("I64"),
+        DType::UInt8 => Ok("U8"),
+        DType::UInt16 => Ok("U16"),
         DType::FP16 => Ok("F16"),
         DType::BF16 => Ok("BF16"),
         DType::FP32 => Ok("F32"),
-        DType::UInt8 => Ok("U8"),
-        DType::Int8 => Ok("I8"),
     }
 }
 
@@ -206,7 +260,10 @@ fn swap_bytes<T: Clone>(data: &mut [T]) {
     }
 }
 
-pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<HashMap<String, Tensor>> {
+/// Load safetensors file and return both tensors and metadata
+pub fn load_safetensors_with_metadata<P: AsRef<Path>>(
+    path: P,
+) -> Result<(HashMap<String, Tensor>, HashMap<String, String>)> {
     let file = File::open(path)?;
     let file_size = file.metadata()?.len();
 
@@ -230,9 +287,31 @@ pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<HashMap<String, Tenso
 
     // Parse header JSON
     let header_json = std::str::from_utf8(&mmap[8..8 + header_size as usize])?;
-    // Remove `"__metadata__":{"format":"pt"},` from the JSON string if present
-    let header_json = header_json.replace(r#""__metadata__":{"format":"pt"},"#, "");
-    let tensor_infos: HashMap<String, TensorInfo> = serde_json::from_str(&header_json)?;
+
+    // Parse as generic JSON first to handle __metadata__
+    let header_value: Value = serde_json::from_str(&header_json)?;
+    let header_obj = header_value.as_object().ok_or_else(|| {
+        SafetensorsError::Custom("Header is not a JSON object".to_string())
+    })?;
+
+    // Extract metadata and tensor infos separately
+    let mut metadata: HashMap<String, String> = HashMap::new();
+    let mut tensor_infos: HashMap<String, TensorInfo> = HashMap::new();
+    for (key, value) in header_obj {
+        if key == "__metadata__" {
+            // Parse metadata - values are strings
+            if let Some(meta_obj) = value.as_object() {
+                for (mk, mv) in meta_obj {
+                    if let Some(s) = mv.as_str() {
+                        metadata.insert(mk.clone(), s.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        let info: TensorInfo = serde_json::from_value(value.clone())?;
+        tensor_infos.insert(key.clone(), info);
+    }
 
     if tensor_infos.len() > SAFETENSORS_MAX_TENSORS {
         return Err(SafetensorsError::Custom(
@@ -256,23 +335,25 @@ pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<HashMap<String, Tenso
         let shape: Vec<usize> = info.shape.iter().map(|&x| x as usize).collect();
 
         // Create CPU tensor and copy data
-        let cpu_tensor = Tensor::new(shape.clone(), dtype, Device::CPU);
+        let mut cpu_tensor = Tensor::new(shape.clone(), dtype, Device::CPU);
         let data_size = info.data_offsets[1] - info.data_offsets[0];
 
         unsafe {
             std::ptr::copy_nonoverlapping(
                 mmap[data_start + info.data_offsets[0]..].as_ptr(),
-                cpu_tensor.get_data_ptr() as *mut u8,
+                cpu_tensor.get_data_ptr_mut(),
                 data_size,
             );
         }
 
-        // Move tensor to target device if needed
-        let device_tensor = cpu_tensor;
-
-        tensors.insert(name.to_string(), device_tensor);
+        tensors.insert(name.to_string(), cpu_tensor);
     }
 
+    Ok((tensors, metadata))
+}
+
+pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<HashMap<String, Tensor>> {
+    let (tensors, _metadata) = load_safetensors_with_metadata(path)?;
     Ok(tensors)
 }
 
@@ -355,7 +436,7 @@ pub fn save_safetensors<P: AsRef<Path>>(
             // Copy tensor data to buffer
             let data = unsafe {
                 std::slice::from_raw_parts(
-                    cpu_tensor.get_data_ptr_const() as *const u8,
+                    cpu_tensor.get_data_ptr(),
                     tensor_info.data_offsets[1] - tensor_info.data_offsets[0],
                 )
             };

@@ -249,10 +249,14 @@ impl ArithDecoder {
                 self.high = ((self.high << 1) & STATE_MASK) | 1;
                 self.code = ((self.code << 1) & STATE_MASK) | self.read_bit() as u64;
             } else if (self.low & !self.high & QUARTER_RANGE) != 0 {
-                // E3: Underflow
+                // E3: Underflow - matches CUDA arith_cuda.cu
                 self.low = ((self.low << 1) ^ HALF_RANGE) & STATE_MASK;
                 self.high = (((self.high ^ HALF_RANGE) << 1) | HALF_RANGE | 1) & STATE_MASK;
-                self.code = (((self.code ^ HALF_RANGE) << 1) & STATE_MASK) | self.read_bit() as u64;
+                // CUDA: code = (code & HALF_RANGE) | ((code << 1) & (STATE_MASK >> 1)) | bit
+                // This preserves the MSB, shifts rest left, and adds new bit
+                let half_bit = self.code & HALF_RANGE;
+                let shifted = (self.code << 1) & (STATE_MASK >> 1);
+                self.code = half_bit | shifted | self.read_bit() as u64;
             } else {
                 break;
             }

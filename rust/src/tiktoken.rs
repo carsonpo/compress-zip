@@ -516,7 +516,22 @@ pub fn load_tiktoken_json_tokenizer(
     json_path: &Path,
 ) -> Result<CoreBPE, Box<dyn std::error::Error + Send + Sync>> {
     let contents = fs::read_to_string(json_path)?;
-    let spec: TiktokenJsonSpec = serde_json::from_str(&contents)?;
+    load_tiktoken_json_from_str(&contents)
+}
+
+/// Load a tokenizer from JSON bytes (e.g., embedded in model file).
+pub fn load_tiktoken_json_from_bytes(
+    json_bytes: &[u8],
+) -> Result<CoreBPE, Box<dyn std::error::Error + Send + Sync>> {
+    let contents = std::str::from_utf8(json_bytes)?;
+    load_tiktoken_json_from_str(contents)
+}
+
+/// Load a tokenizer from a JSON string.
+fn load_tiktoken_json_from_str(
+    contents: &str,
+) -> Result<CoreBPE, Box<dyn std::error::Error + Send + Sync>> {
+    let spec: TiktokenJsonSpec = serde_json::from_str(contents)?;
 
     // convert string keys → Vec<u8>
     let mut mergeable: HashMap<Vec<u8>, Rank> = HashMap::with_capacity(spec.mergeable_ranks.len());

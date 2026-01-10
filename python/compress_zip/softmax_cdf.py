@@ -2,125 +2,162 @@
 Softmax CDF builder for arithmetic coding.
 
 Converts int32 logits to cumulative frequency table for arithmetic coder.
+Matches CUDA softmax_cumfreq.cu exactly (softmax_cumfreq_i32_u32_kernel).
 """
 
 import numpy as np
 from typing import Tuple
 
 from .primitives import argmax_deterministic
-from .lut import get_exp2_lut, exp_q16_from_neg_fixed
+from .lut import get_exp2_lut
 
+# Constants matching CUDA softmax_cumfreq.cu
+NUM_STATE_BITS = 32
+QUARTER_RANGE = 1 << (NUM_STATE_BITS - 2)  # 1 << 30 = 1073741824
 
-# Target total for frequency table (power of 2 for efficient coding)
-TARGET_TOTAL_BITS = 16
-TARGET_TOTAL = 1 << TARGET_TOTAL_BITS  # 65536
+# Exp coefficient matching CUDA (W_CLIP = 0.1, same as lm_head weight clip)
+LOG2E = 1.4426950408889634
+W_CLIP = 0.1  # Must match lm_head weight clip in model
+COEF_D = (W_CLIP * LOG2E) / 64.0
+COEF_Q24 = int(COEF_D * (1 << 24) + 0.5)  # ~37817
 
 
 def compute_target_total(vocab_size: int) -> int:
     """
     Compute target total for frequency table.
-
-    Must be large enough that each symbol gets at least frequency 1.
-    Using 2^16 = 65536 works for vocab_size <= 65536.
+    Matches CUDA: target_total = QUARTER_RANGE - vocab_size - 1024
     """
-    # Ensure each symbol can have at least freq 1
-    return max(TARGET_TOTAL, vocab_size)
+    target = QUARTER_RANGE - vocab_size - 1024
+    # Safety check
+    if target <= vocab_size:
+        target = vocab_size + 1
+    return target
+
+
+def exp_q16_from_diff_acc(diff: int, exp_lut) -> int:
+    """
+    Compute exp2 for logit difference (int32 GEMM accumulator).
+    Matches CUDA exp_q16_from_diff_acc exactly.
+
+    diff = logit - max_logit (<= 0)
+    Returns uint16 Q16 representation.
+    """
+    if diff >= 0:
+        return 65535
+
+    neg = -diff
+
+    # t256 = round(neg * COEF_Q24 / 2^24)
+    t256 = (neg * COEF_Q24 + (1 << 23)) >> 24
+
+    ip = t256 >> 8  # integer part
+    frac = t256 & 255  # fractional part
+
+    if ip >= 31:
+        return 1
+
+    base = (1 << 16) >> ip
+
+    # Get fractional multiplier from LUT
+    frac_mul = int(exp_lut[frac])
+
+    # Q16 * Q16 -> Q16 (rounded)
+    out = (base * frac_mul + 0x8000) >> 16
+
+    if out < 1:
+        out = 1
+    if out > 65535:
+        out = 65535
+
+    return out
 
 
 def build_cumfreqs(
     logits: np.ndarray,
     vocab_size: int | None = None,
+    exp_lut = None,
 ) -> Tuple[np.ndarray, int]:
     """
     Build cumulative frequency table from int32 logits.
+    Matches CUDA softmax_cumfreq_i32_u32_kernel exactly.
 
-    Implements online softmax with integer arithmetic:
-    1. Find max logit for numerical stability
-    2. Compute exp(logit - max) for each symbol using exp2 LUT
-    3. Normalize to target total
-    4. Build cumulative frequencies
+    Algorithm:
+    1. Find max logit and argmax (smallest index for ties)
+    2. Compute exp weights using exp_q16_from_diff_acc
+    3. Sum exp weights
+    4. Allocate frequencies: freq = 1 + floor(exp * remaining / sum_exp)
+    5. Add remainder to argmax
+    6. Build inclusive cumsum (no leading 0)
 
     Args:
         logits: Int32 logits of shape [vocab_size]
         vocab_size: Optional vocab size (defaults to len(logits))
+        exp_lut: Optional exp2 LUT (defaults to get_exp2_lut())
 
     Returns:
-        Tuple of (cumfreqs array of shape [vocab_size + 1], total)
-        cumfreqs[0] = 0, cumfreqs[vocab_size] = total
+        Tuple of (cumfreqs array of shape [vocab_size], target_total)
+        cumfreqs is inclusive prefix sum: cumfreqs[-1] = target_total
     """
     if vocab_size is None:
         vocab_size = len(logits)
 
     assert len(logits) >= vocab_size
 
-    exp_lut = get_exp2_lut()
+    if exp_lut is None:
+        exp_lut = get_exp2_lut()
     target_total = compute_target_total(vocab_size)
 
-    # Find max logit
-    max_logit = int(np.max(logits[:vocab_size]))
+    # Pass 1: Find max logit
+    max_val = int(np.max(logits[:vocab_size]))
 
-    # Compute unnormalized probabilities using exp2
-    # We convert logit differences to exp2 input format
+    # Find argmax (smallest index for ties) - matches CUDA
+    argmax_idx = argmax_deterministic(logits[:vocab_size].tolist())
 
-    # Scale factor: how many logit units per bit of exponent
-    # This is tunable based on the expected range of logits
-    # For int32 GEMM accumulators, logits can be large
-    # Using a scale that maps reasonable differences to exp range
-    LOGIT_SCALE_BITS = 8  # Shift logit diff right by this much
-
-    probs = np.zeros(vocab_size, dtype=np.int64)
-    total_prob = 0
+    # Pass 2: Compute exp weights and sum
+    exp_weights = []
+    sum_exp = 0
 
     for i in range(vocab_size):
-        diff = max_logit - int(logits[i])  # Always >= 0
+        diff = int(logits[i]) - max_val  # <= 0
+        e = exp_q16_from_diff_acc(diff, exp_lut)
+        exp_weights.append(e)
+        sum_exp += e
 
-        # Convert to Q8 exponent for exp2 lookup
-        # Larger diff = smaller probability
-        neg_exp_q8 = diff >> (LOGIT_SCALE_BITS - 8)  # Scale to Q8
+    # Ensure sum_exp is at least 1 to avoid division by zero
+    if sum_exp == 0:
+        sum_exp = 1
 
-        prob = exp_q16_from_neg_fixed(neg_exp_q8, exp_lut)
-        probs[i] = prob
-        total_prob += prob
+    # Pass 3: Allocate frequencies
+    # remaining = target_total - V
+    # freq = 1 + floor(exp * remaining / sum_exp)
+    remaining = target_total - vocab_size
 
-    # Normalize to target_total
-    if total_prob == 0:
-        # All probabilities underflowed, give uniform distribution
-        freq_per_symbol = target_total // vocab_size
-        remainder = target_total - freq_per_symbol * vocab_size
-        freqs = np.full(vocab_size, freq_per_symbol, dtype=np.int32)
-        # Distribute remainder to first symbols
-        for i in range(remainder):
-            freqs[i] += 1
-    else:
-        # Scale probabilities to target_total
-        freqs = np.zeros(vocab_size, dtype=np.int32)
-        allocated = 0
+    freqs = []
+    freq_sum = 0
 
-        for i in range(vocab_size):
-            # freq[i] = probs[i] * target_total / total_prob
-            # Use 64-bit to avoid overflow
-            freq = (probs[i] * target_total + total_prob // 2) // total_prob
-            freq = max(1, int(freq))  # Ensure minimum freq of 1
-            freqs[i] = freq
-            allocated += freq
-
-        # Adjust to exactly match target_total
-        diff = target_total - allocated
-        if diff != 0:
-            # Find the symbol with highest probability and adjust it
-            max_idx = argmax_deterministic([int(f) for f in freqs])
-            freqs[max_idx] += diff
-
-    # Build cumulative frequencies
-    cumfreqs = np.zeros(vocab_size + 1, dtype=np.int32)
-    cumfreqs[0] = 0
     for i in range(vocab_size):
-        cumfreqs[i + 1] = cumfreqs[i] + freqs[i]
+        e = exp_weights[i]
+        # e * remaining needs 64-bit (uint16 * uint32 = up to 2^46)
+        add = (e * remaining) // sum_exp
+        f = 1 + add
+        freqs.append(f)
+        freq_sum += f
 
-    total = int(cumfreqs[vocab_size])
-    assert total == target_total, f"Total {total} != target {target_total}"
+    # Add remainder to argmax
+    rem = target_total - freq_sum
+    freqs[argmax_idx] += rem
 
-    return cumfreqs, total
+    # Pass 4: Build inclusive cumsum (no leading 0)
+    cumfreqs = np.zeros(vocab_size, dtype=np.uint32)
+    running_sum = 0
+    for i in range(vocab_size):
+        running_sum += freqs[i]
+        cumfreqs[i] = running_sum
+
+    # Verify total
+    assert cumfreqs[-1] == target_total, f"Total {cumfreqs[-1]} != target {target_total}"
+
+    return cumfreqs, target_total
 
 
 def build_cumfreqs_simple(

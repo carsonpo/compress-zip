@@ -15,7 +15,8 @@ EXP_Q16_SCALE = 1 << 16  # Q16 format
 
 ROPE_HEAD_DIM = 64
 ROPE_HALF_DIM = ROPE_HEAD_DIM // 2
-ROPE_MAX_SEQ_LEN = 64
+ROPE_DEFAULT_MAX_SEQ_LEN = 64  # Matches TOKENS_PER_CHUNK for chunked processing
+ROPE_MAX_SEQ_LEN = ROPE_DEFAULT_MAX_SEQ_LEN  # Alias for backwards compatibility
 ROPE_Q15_SCALE = 1 << 15  # Q1.15 format
 ROPE_BASE = 10000.0
 
@@ -24,9 +25,10 @@ class Exp2LutQ16:
     """
     256-entry exp2 fractional LUT in Q16 format.
 
-    exp2_lut[i] = round(2^(i/256) * 65536)
+    exp2_lut[i] = round(2^(-i/256) * 65536)  # NEGATIVE exponent matching CUDA
 
-    Used for computing exp2(x) where x has 8 fractional bits.
+    Used for computing exp2(-x) where x has 8 fractional bits.
+    This matches CUDA softmax_cumfreq.cu exactly.
     """
 
     def __init__(self):
@@ -34,12 +36,17 @@ class Exp2LutQ16:
         self._generate()
 
     def _generate(self):
-        """Generate the exp2 LUT."""
+        """Generate the exp2 LUT matching CUDA negative exponent formula."""
         self.table = []
         for i in range(EXP_FRAC_SIZE):
-            # 2^(i/256) in Q16
-            val = math.pow(2.0, i / EXP_FRAC_SIZE) * EXP_Q16_SCALE
-            self.table.append(int(round(val)))
+            # CUDA uses NEGATIVE exponent: 2^(-i/256) in Q16
+            # softmax_cumfreq.cu: double v = std::pow(2.0, -frac) * 65536.0;
+            frac = i / EXP_FRAC_SIZE
+            val = math.pow(2.0, -frac) * EXP_Q16_SCALE
+            # Use ties-to-even rounding to match CUDA llrint
+            q = round(val)  # Python 3 round uses ties-to-even
+            q = max(1, min(65535, int(q)))
+            self.table.append(q)
 
     def __getitem__(self, idx: int) -> int:
         return self.table[idx & 0xFF]
@@ -60,17 +67,21 @@ class RopeLut:
     sin_lut[pos][i] = round(sin(theta_i) * 32768)
     """
 
-    def __init__(self):
-        self.cos_table: np.ndarray = np.zeros((ROPE_MAX_SEQ_LEN, ROPE_HALF_DIM), dtype=np.int16)
-        self.sin_table: np.ndarray = np.zeros((ROPE_MAX_SEQ_LEN, ROPE_HALF_DIM), dtype=np.int16)
+    def __init__(self, max_seq_len: int = ROPE_DEFAULT_MAX_SEQ_LEN, head_dim: int = ROPE_HEAD_DIM, base: float = ROPE_BASE):
+        self.max_seq_len = max_seq_len
+        self.head_dim = head_dim
+        self.half_dim = head_dim // 2
+        self.base = base
+        self.cos_table: np.ndarray = np.zeros((max_seq_len, self.half_dim), dtype=np.int16)
+        self.sin_table: np.ndarray = np.zeros((max_seq_len, self.half_dim), dtype=np.int16)
         self._generate()
 
     def _generate(self):
         """Generate the RoPE LUTs."""
-        for pos in range(ROPE_MAX_SEQ_LEN):
-            for i in range(ROPE_HALF_DIM):
+        for pos in range(self.max_seq_len):
+            for i in range(self.half_dim):
                 # Compute frequency: 1 / (base ^ (2i / head_dim))
-                freq = 1.0 / math.pow(ROPE_BASE, (2 * i) / ROPE_HEAD_DIM)
+                freq = 1.0 / math.pow(self.base, (2 * i) / self.head_dim)
                 theta = pos * freq
 
                 # Store in Q1.15
@@ -149,27 +160,37 @@ def get_rope_lut() -> RopeLut:
 
 # Test cases
 if __name__ == "__main__":
-    # Test Exp2LutQ16
+    # Test Exp2LutQ16 - now uses NEGATIVE exponent: 2^(-i/256)
     lut = Exp2LutQ16()
-    assert lut[0] == 65536  # 2^0 = 1.0 in Q16
-    assert abs(lut[128] - int(round(math.sqrt(2) * 65536))) <= 1  # 2^0.5
-    assert abs(lut[255] - int(round(math.pow(2, 255/256) * 65536))) <= 1
+    # At i=0, 2^(-0) = 1.0 -> 65536 in Q16 (clamped to 65535)
+    assert lut[0] == 65535, f"Expected 65535, got {lut[0]}"
+    # At i=128, 2^(-0.5) = 1/sqrt(2) ≈ 0.7071
+    expected_half = int(round(math.pow(2, -0.5) * 65536))
+    assert abs(lut[128] - expected_half) <= 1, f"Expected ~{expected_half}, got {lut[128]}"
+    # At i=255, 2^(-255/256) ≈ 0.5027
+    expected_near_one = int(round(math.pow(2, -255/256) * 65536))
+    assert abs(lut[255] - expected_near_one) <= 1
+    # Table should be monotonically decreasing (exp(-x) decreases as x increases)
+    for i in range(1, EXP_FRAC_SIZE):
+        assert lut[i] <= lut[i-1], f"Table not decreasing at {i}"
     print("Exp2LutQ16 tests passed")
 
     # Test RopeLut
     rope = RopeLut()
     # At position 0, all angles are 0, so cos=1, sin=0
-    assert rope.get_cos(0, 0) == 32768  # cos(0) = 1 in Q15
+    # Note: 1.0 * 32768 = 32768, which is clamped to 32767 in Q1.15
+    assert rope.get_cos(0, 0) == 32767, f"Expected 32767, got {rope.get_cos(0, 0)}"
     assert rope.get_sin(0, 0) == 0  # sin(0) = 0
     print("RopeLut tests passed")
 
-    # Test exp_q16_from_neg_fixed
-    result = exp_q16_from_neg_fixed(0, lut)  # 2^0 = 1
-    assert result == 65536
-    result = exp_q16_from_neg_fixed(256, lut)  # 2^(-1) = 0.5
-    assert result == 32768
-    result = exp_q16_from_neg_fixed(512, lut)  # 2^(-2) = 0.25
-    assert result == 16384
+    # Test exp_q16_from_neg_fixed with the negative exponent LUT
+    # Note: This function now works with the negative exponent LUT
+    result = exp_q16_from_neg_fixed(0, lut)  # 2^0 = 1 (via lut[0] / 2^0)
+    assert result == 65535, f"Expected 65535, got {result}"
+    result = exp_q16_from_neg_fixed(256, lut)  # int_part=1, frac_part=0 -> lut[0] >> 1
+    assert result == 32767, f"Expected 32767, got {result}"
+    result = exp_q16_from_neg_fixed(512, lut)  # int_part=2, frac_part=0 -> lut[0] >> 2
+    assert result == 16383, f"Expected 16383, got {result}"
     print("exp_q16_from_neg_fixed tests passed")
 
     print("All LUT tests passed!")

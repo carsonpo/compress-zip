@@ -2,6 +2,7 @@
 //!
 //! Converts raw GEMM accumulators (int32) to cumulative frequencies
 //! for arithmetic coding.
+//! Matches CUDA softmax_cumfreq.cu exactly (softmax_cumfreq_i32_u32_kernel).
 
 use crate::lut::{Exp2LutQ16, EXP_FRAC_SIZE};
 use crate::primitives::{argmax_deterministic, round_ties_to_even_host};
@@ -12,16 +13,22 @@ pub const STATE_MASK: u64 = (1u64 << NUM_STATE_BITS) - 1;
 pub const HALF_RANGE: u64 = 1u64 << (NUM_STATE_BITS - 1);
 pub const QUARTER_RANGE: u64 = 1u64 << (NUM_STATE_BITS - 2);
 
-/// Compute the coefficient for logits exp mapping.
-///
-/// coef_q24 = round(scale_factor * 2^24)
-///
-/// For raw GEMM accumulators with lm_head weight clip, scale_factor should be:
-/// log2(e) * lm_head_w_clip / 16384
-pub fn compute_coef_q24_for_acc(lm_head_w_clip: f64) -> u32 {
-    const LOG2E: f64 = 1.4426950408889634;
-    let scale = LOG2E * lm_head_w_clip / 16384.0;
-    round_ties_to_even_host(scale * (1u64 << 24) as f64).clamp(1, u32::MAX as i64) as u32
+/// Constants matching CUDA softmax_cumfreq.cu
+pub const LOG2E: f64 = 1.4426950408889634;
+pub const W_CLIP: f64 = 0.1; // Must match lm_head weight clip in model
+
+/// Compute COEF_Q24 matching CUDA exactly.
+/// CUDA formula: COEF_D = (W_CLIP * LOG2E) / 64.0
+/// where W_CLIP = 0.1 is the lm_head weight clip.
+pub fn compute_coef_q24() -> u32 {
+    let coef_d = (W_CLIP * LOG2E) / 64.0;
+    round_ties_to_even_host(coef_d * (1u64 << 24) as f64).clamp(1, u32::MAX as i64) as u32
+}
+
+/// Legacy function for compatibility - use compute_coef_q24() instead.
+/// The lm_head_w_clip parameter is ignored; W_CLIP=0.1 is always used.
+pub fn compute_coef_q24_for_acc(_lm_head_w_clip: f64) -> u32 {
+    compute_coef_q24()
 }
 
 /// Compute target_total for frequency allocation.

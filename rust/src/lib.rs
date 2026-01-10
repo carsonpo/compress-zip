@@ -17,6 +17,7 @@ pub mod arith_coder;
 pub mod file_format;
 pub mod safetensors;
 pub mod tiktoken;
+pub mod model;
 
 // Re-export commonly used types
 pub use arith_coder::{ArithEncoder, ArithDecoder};

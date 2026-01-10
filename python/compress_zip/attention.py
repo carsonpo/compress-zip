@@ -8,23 +8,66 @@ import numpy as np
 from typing import Optional
 from dataclasses import dataclass
 
-from .primitives import sra_rne_tte_s32, sra_rne_tte_s64_to_s32, clamp_i8
-from .lut import get_rope_lut, get_exp2_lut, exp_q16_from_neg_fixed, ROPE_HALF_DIM
+from .primitives import sra_rne_tte_s32, sra_rne_tte_s64_to_s32, clamp_i8, div_rne_tte_s64_to_s32
+from .lut import get_rope_lut, get_exp2_lut, ROPE_HALF_DIM
 
-# Constants matching CUDA
+# Constants matching CUDA attention.cu
 HEAD_DIM = 64
 MAX_SEQ_LEN = 64
 TOKENS_PER_BATCH = 16
 
-# Attention scaling coefficient
-# We want to divide by sqrt(HEAD_DIM) = 8
-# In Q24 format: coefficient = 2^24 / 8 = 2097152
-SQRT_HEAD_DIM = 8
-SQRT_HEAD_DIM_SHIFT = 3  # log2(8) = 3
-ATTN_COEF_Q24 = (1 << 24) // SQRT_HEAD_DIM  # 2097152
+# CUDA constants for attention score scaling
+Q_SHIFT = 2
+SQRT_HEAD_DIM_SHIFT = 3
 
-# Q/K scaling for attention
-Q_SHIFT = 2  # Additional shift for Q to prevent overflow
+# Score to exp mapping coefficient for Q0.14 scores (matches CUDA exactly)
+# LOG2E = 1.4426950408889634
+# ATTN_COEF = LOG2E / 64.0
+# ATTN_COEF_Q24 = round(ATTN_COEF * 2^24)
+LOG2E = 1.4426950408889634
+ATTN_COEF = LOG2E / 64.0
+ATTN_COEF_Q24 = int(ATTN_COEF * (1 << 24) + 0.5)  # 378173
+
+
+def exp_q16_from_attn_diff(diff: int, exp_lut) -> int:
+    """
+    Compute exp2 for attention score difference.
+    Matches CUDA exp_q16_from_attn_diff exactly.
+
+    diff should be <= 0 (score - max_score)
+    Returns uint16 Q16 representation.
+    """
+    if diff >= 0:
+        return 65535
+
+    neg = -diff
+
+    # t256 = round(neg * ATTN_COEF_Q24 / 2^24)
+    t256 = (neg * ATTN_COEF_Q24 + (1 << 23)) >> 24
+
+    ip = t256 >> 8  # integer part
+    frac = t256 & 255  # fractional part
+
+    if ip >= 31:
+        return 1
+
+    base = (1 << 16) >> ip
+
+    # Get fractional multiplier from LUT
+    if hasattr(exp_lut, '__getitem__'):
+        # numpy array or Exp2LutQ16 class
+        frac_mul = int(exp_lut[frac])
+    else:
+        frac_mul = int(exp_lut[frac])
+
+    out = (base * frac_mul + 0x8000) >> 16
+
+    if out < 1:
+        out = 1
+    if out > 65535:
+        out = 65535
+
+    return out
 
 
 @dataclass
@@ -59,20 +102,33 @@ class KVCache:
 def apply_rope_i8(
     x: np.ndarray,
     pos: int,
+    rope_cos: np.ndarray = None,
+    rope_sin: np.ndarray = None,
 ) -> np.ndarray:
     """
     Apply RoPE to a single vector at position pos.
 
     x is [head_dim] as int8.
+    rope_cos/rope_sin: [max_seq_len, half_dim] int16 LUTs (optional, generated if not provided)
     Returns rotated vector as int8.
     """
-    rope_lut = get_rope_lut()
+    # Use embedded LUTs if provided, otherwise generate
+    if rope_cos is None or rope_sin is None:
+        rope_lut = get_rope_lut()
+        use_class = True
+    else:
+        use_class = False
+
     out = np.zeros_like(x)
 
     for i in range(ROPE_HALF_DIM):
         # Get cos/sin from LUT (Q15)
-        cos_val = rope_lut.get_cos(pos, i)
-        sin_val = rope_lut.get_sin(pos, i)
+        if use_class:
+            cos_val = rope_lut.get_cos(pos, i)
+            sin_val = rope_lut.get_sin(pos, i)
+        else:
+            cos_val = int(rope_cos[pos, i])
+            sin_val = int(rope_sin[pos, i])
 
         # Get pair of values
         x0 = int(x[i])
@@ -96,18 +152,31 @@ def apply_rope_i8(
 def apply_rope_q_i8(
     q: np.ndarray,
     pos: int,
+    rope_cos: np.ndarray = None,
+    rope_sin: np.ndarray = None,
 ) -> np.ndarray:
     """
     Apply RoPE to Q with additional scaling (shift by Q_SHIFT).
 
     This prevents overflow in attention scores.
+    rope_cos/rope_sin: [max_seq_len, half_dim] int16 LUTs (optional, generated if not provided)
     """
-    rope_lut = get_rope_lut()
+    # Use embedded LUTs if provided, otherwise generate
+    if rope_cos is None or rope_sin is None:
+        rope_lut = get_rope_lut()
+        use_class = True
+    else:
+        use_class = False
+
     out = np.zeros_like(q)
 
     for i in range(ROPE_HALF_DIM):
-        cos_val = rope_lut.get_cos(pos, i)
-        sin_val = rope_lut.get_sin(pos, i)
+        if use_class:
+            cos_val = rope_lut.get_cos(pos, i)
+            sin_val = rope_lut.get_sin(pos, i)
+        else:
+            cos_val = int(rope_cos[pos, i])
+            sin_val = int(rope_sin[pos, i])
 
         x0 = int(q[i])
         x1 = int(q[i + ROPE_HALF_DIM])
@@ -115,9 +184,17 @@ def apply_rope_q_i8(
         out0 = x0 * cos_val - x1 * sin_val
         out1 = x0 * sin_val + x1 * cos_val
 
-        # Extra shift for Q
-        out[i] = clamp_i8(sra_rne_tte_s32(out0, 15 + Q_SHIFT))
-        out[i + ROPE_HALF_DIM] = clamp_i8(sra_rne_tte_s32(out1, 15 + Q_SHIFT))
+        # CUDA: shift by 15 first, then by NET_SHIFT (two separate rounding operations)
+        # NET_SHIFT = SQRT_HEAD_DIM_SHIFT - Q_SHIFT = 3 - 2 = 1
+        x_rot = sra_rne_tte_s32(out0, 15)
+        y_rot = sra_rne_tte_s32(out1, 15)
+
+        # Apply NET_SHIFT = 1
+        x_rot = sra_rne_tte_s32(x_rot, 1)
+        y_rot = sra_rne_tte_s32(y_rot, 1)
+
+        out[i] = clamp_i8(x_rot)
+        out[i + ROPE_HALF_DIM] = clamp_i8(y_rot)
 
     return out.astype(np.int8)
 
@@ -128,9 +205,14 @@ def gqa_attention_mqa_i8(
     v: np.ndarray,
     pos: int,
     kv_cache: Optional[KVCache] = None,
+    exp2_lut: np.ndarray = None,
+    rope_cos: np.ndarray = None,
+    rope_sin: np.ndarray = None,
+    score_mul_q15: int = 32768,
 ) -> np.ndarray:
     """
     Multi-Query Attention (MQA) with single K/V head.
+    Matches CUDA gqa_attention_mqa_i8_kernel exactly.
 
     Args:
         q: Query vector [head_dim] as int8
@@ -138,15 +220,23 @@ def gqa_attention_mqa_i8(
         v: Value vector [head_dim] as int8
         pos: Current position (0-indexed)
         kv_cache: Optional KV cache for autoregressive generation
+        exp2_lut: Optional [256] uint16 exp2 LUT (uses generated if not provided)
+        rope_cos: Optional [max_seq_len, half_dim] int16 RoPE cos LUT
+        rope_sin: Optional [max_seq_len, half_dim] int16 RoPE sin LUT
+        score_mul_q15: Score multiplier in Q0.15 format (default 32768 = 1.0)
 
     Returns:
         Output vector [head_dim] as int8
     """
-    exp_lut = get_exp2_lut()
+    # Use embedded LUTs if provided, otherwise generate
+    if exp2_lut is None:
+        exp_lut = get_exp2_lut()
+    else:
+        exp_lut = exp2_lut
 
     # Apply RoPE
-    q_rot = apply_rope_q_i8(q, pos)
-    k_rot = apply_rope_i8(k, pos)
+    q_rot = apply_rope_q_i8(q, pos, rope_cos, rope_sin)
+    k_rot = apply_rope_i8(k, pos, rope_cos, rope_sin)
 
     # Update KV cache if provided
     if kv_cache is not None:
@@ -161,70 +251,155 @@ def gqa_attention_mqa_i8(
         k_cache = k_rot.reshape(1, -1)
         v_cache = v.reshape(1, -1)
 
-    # Compute attention scores: Q @ K^T
-    # Q is scaled down by Q_SHIFT already
-    scores = np.zeros(seq_len, dtype=np.int32)
-    q_i32 = q_rot.astype(np.int32)
-
-    for s in range(seq_len):
-        k_i32 = k_cache[s].astype(np.int32)
-        score = 0
+    # Compute attention scores matching CUDA exactly
+    scores = []
+    for t in range(seq_len):
+        # Q*K dot product
+        dot = 0
         for d in range(HEAD_DIM):
-            score += q_i32[d] * k_i32[d]
-        scores[s] = score
+            dot += int(q_rot[d]) * int(k_cache[t, d])
 
-    # Find max score for numerical stability
-    max_score = int(np.max(scores))
+        # CUDA: dot_unshift = round(dot >> Q_SHIFT)
+        dot_unshift = sra_rne_tte_s32(dot, Q_SHIFT)
 
-    # Compute softmax using integer exp
-    # exp(score - max_score) approximated as exp2((score - max_score) * log2(e))
-    # For simplicity, we use a fixed-point approximation
+        # CUDA: prod = dot_unshift * score_mul; score = round(prod >> 15)
+        prod = dot_unshift * score_mul_q15
+        score = sra_rne_tte_s64_to_s32(prod, 15)
+        scores.append(score)
 
-    # Convert score differences to Q8 format for exp lookup
-    # score diff is in range [-(max-min), 0]
-    # We want to compute exp2(diff * scale) where scale converts to log2 base
+    # Online softmax (matching CUDA)
+    m = -(1 << 30)  # Running max (use large negative instead of INT32_MIN)
+    s = 0  # Running sum of exp weights (uint64)
+    vacc = [0] * HEAD_DIM  # Weighted V accumulator (int64)
 
-    # Simpler approach: use scaled differences directly
-    # Each score unit roughly corresponds to some fraction of a bit
-    EXP_SCALE = 4  # Tunable: how many score units per bit of exponent
+    for t in range(seq_len):
+        score = scores[t]
 
-    weights_q16 = np.zeros(seq_len, dtype=np.int64)
-    for s in range(seq_len):
-        diff = max_score - scores[s]  # Always >= 0
-        neg_exp_q8 = diff * EXP_SCALE  # Convert to Q8 exponent
-        weights_q16[s] = exp_q16_from_neg_fixed(neg_exp_q8, exp_lut)
+        # Update online softmax
+        if score > m:
+            # New max found - rescale
+            if m != -(1 << 30):
+                diff_old = m - score
+                scale_old = exp_q16_from_attn_diff(diff_old, exp_lut)
+                # Rescale S: (S * scale + 0x8000) >> 16
+                s = (s * scale_old + 0x8000) >> 16
+                # Rescale vacc
+                for i in range(HEAD_DIM):
+                    prod = vacc[i] * scale_old
+                    # Symmetric rounding
+                    if prod >= 0:
+                        vacc[i] = (prod + (1 << 15)) >> 16
+                    else:
+                        vacc[i] = -((-prod + (1 << 15)) >> 16)
+            m = score
 
-    # Normalize weights
-    total_weight = int(np.sum(weights_q16))
-    if total_weight == 0:
-        total_weight = 1
+        # Compute exp weight for this token
+        diff = score - m
+        w = exp_q16_from_attn_diff(diff, exp_lut)
+        s += w
 
-    # Compute weighted sum of values
-    output_acc = np.zeros(HEAD_DIM, dtype=np.int64)
+        # Accumulate weighted V
+        for i in range(HEAD_DIM):
+            vacc[i] += w * int(v_cache[t, i])
 
-    for s in range(seq_len):
-        w = int(weights_q16[s])
-        v_i32 = v_cache[s].astype(np.int32)
-        for d in range(HEAD_DIM):
-            output_acc[d] += w * v_i32[d]
-
-    # Normalize by total weight and convert back to int8
-    # output_acc is Q16 * Q0.7 = Q0.23
-    # Divide by total_weight (in Q16) to get Q0.7
+    # Normalize output
+    denom = s if s != 0 else 1
     output = np.zeros(HEAD_DIM, dtype=np.int8)
 
-    for d in range(HEAD_DIM):
-        # Divide with rounding
-        val = output_acc[d]
-        if total_weight > 0:
-            # Round to nearest
-            if val >= 0:
-                result = (val + total_weight // 2) // total_weight
-            else:
-                result = (val - total_weight // 2) // total_weight
-        else:
-            result = 0
-        output[d] = clamp_i8(int(result))
+    for i in range(HEAD_DIM):
+        y = div_rne_tte_s64_to_s32(vacc[i], denom)
+        output[i] = clamp_i8(y)
+
+    return output
+
+
+def gqa_attention_mqa_i8_cached(
+    q: np.ndarray,
+    k_cache: np.ndarray,
+    v_cache: np.ndarray,
+    pos: int,
+    exp2_lut: np.ndarray = None,
+    rope_cos: np.ndarray = None,
+    rope_sin: np.ndarray = None,
+    score_mul_q15: int = 32768,
+) -> np.ndarray:
+    """
+    Multi-Query Attention with pre-cached K/V.
+    Matches CUDA exactly - K is already rotated and stored in cache.
+
+    Args:
+        q: Query vector [head_dim] as int8
+        k_cache: Key cache [seq_len, head_dim] as int8 (already RoPE'd)
+        v_cache: Value cache [seq_len, head_dim] as int8
+        pos: Current position (0-indexed)
+        exp2_lut: Optional [256] uint16 exp2 LUT
+        rope_cos: Optional [max_seq_len, half_dim] int16 RoPE cos LUT
+        rope_sin: Optional [max_seq_len, half_dim] int16 RoPE sin LUT
+        score_mul_q15: Score multiplier in Q0.15 format
+
+    Returns:
+        Output vector [head_dim] as int8
+    """
+    if exp2_lut is None:
+        exp_lut = get_exp2_lut()
+    else:
+        exp_lut = exp2_lut
+
+    # Apply RoPE to Q only (K is already rotated in cache)
+    q_rot = apply_rope_q_i8(q, pos, rope_cos, rope_sin)
+
+    seq_len = pos + 1
+
+    # Compute attention scores matching CUDA exactly
+    scores = []
+    for t in range(seq_len):
+        # Q*K dot product
+        dot = 0
+        for d in range(HEAD_DIM):
+            dot += int(q_rot[d]) * int(k_cache[t, d])
+
+        # CUDA: dot_unshift = round(dot >> Q_SHIFT)
+        dot_unshift = sra_rne_tte_s32(dot, Q_SHIFT)
+
+        # CUDA: prod = dot_unshift * score_mul; score = round(prod >> 15)
+        prod = dot_unshift * score_mul_q15
+        score = sra_rne_tte_s64_to_s32(prod, 15)
+        scores.append(score)
+
+    # Online softmax (matching CUDA)
+    m = -(1 << 30)
+    s = 0
+    vacc = [0] * HEAD_DIM
+
+    for t in range(seq_len):
+        score = scores[t]
+
+        if score > m:
+            if m != -(1 << 30):
+                diff_old = m - score
+                scale_old = exp_q16_from_attn_diff(diff_old, exp_lut)
+                s = (s * scale_old + 0x8000) >> 16
+                for i in range(HEAD_DIM):
+                    prod = vacc[i] * scale_old
+                    if prod >= 0:
+                        vacc[i] = (prod + (1 << 15)) >> 16
+                    else:
+                        vacc[i] = -((-prod + (1 << 15)) >> 16)
+            m = score
+
+        diff = score - m
+        w = exp_q16_from_attn_diff(diff, exp_lut)
+        s += w
+
+        for i in range(HEAD_DIM):
+            vacc[i] += w * int(v_cache[t, i])
+
+    denom = s if s != 0 else 1
+    output = np.zeros(HEAD_DIM, dtype=np.int8)
+
+    for i in range(HEAD_DIM):
+        y = div_rne_tte_s64_to_s32(vacc[i], denom)
+        output[i] = clamp_i8(y)
 
     return output
 
