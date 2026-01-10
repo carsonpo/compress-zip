@@ -17,14 +17,18 @@ This repository contains reference implementations of the DETAC (Deterministic T
 
 ## Compression Benchmarks
 
-Comparison on Alice in Wonderland Chapter 1 (11,782 bytes):
+Wikipedia articles (~15KB each, plain text):
 
-| Method | Size | Ratio | vs Best Traditional |
-|--------|------|-------|---------------------|
-| **CZIP (Rust)** | 3,952 | **2.98x** | baseline |
-| brotli-11 | 4,251 | 2.77x | +7.6% larger |
-| zstd-22 | 4,841 | 2.43x | +22.5% larger |
-| gzip-9 | 5,011 | 2.35x | +26.8% larger |
+| Article | Size | CZIP | brotli-11 | zstd-22 | gzip-9 |
+|---------|------|------|-----------|---------|--------|
+| Machine Learning | 15,003 | **3,932 (3.82x)** | 4,303 (3.49x) | 5,541 (2.71x) | 5,783 (2.59x) |
+| World War II | 15,024 | **4,388 (3.42x)** | 4,729 (3.18x) | 5,914 (2.54x) | 6,139 (2.45x) |
+| Python (PL) | 15,020 | **4,410 (3.41x)** | 4,670 (3.22x) | 5,852 (2.57x) | 6,079 (2.47x) |
+| Einstein | 15,038 | **4,448 (3.38x)** | 4,920 (3.06x) | 6,306 (2.38x) | 6,546 (2.30x) |
+| Rust (PL) | 15,014 | **4,545 (3.30x)** | 4,727 (3.18x) | 6,001 (2.50x) | 6,217 (2.41x) |
+| Alice Ch.1 | 11,782 | **3,952 (2.98x)** | 4,251 (2.77x) | 4,841 (2.43x) | 5,011 (2.35x) |
+
+CZIP beats brotli-11 by 4-10% on clean natural language text.
 
 **Speed**: ~27,000 tokens/sec encode/decode (parallel, Rust with rayon)
 
@@ -34,10 +38,11 @@ Comparison on Alice in Wonderland Chapter 1 (11,782 bytes):
 
 | Compressor | Model | Compression | Speed | Hardware |
 |------------|-------|-------------|-------|----------|
-| **CZIP** | 1-layer, 1024 vocab | 2.98x | ~27,000 tok/s | CPU |
+| **CZIP** | 1-layer, 1024 vocab | 3.0-3.8x | ~27,000 tok/s | CPU |
 | [ts_zip](https://bellard.org/ts_zip/) | RWKV 169M | ~7x | ~577 tok/s | RTX 4090 GPU |
 | [llama-zip](https://github.com/alexbuz/llama-zip) | Llama 3.1 8B | 8-29x | ~30 tok/s | GPU required |
 
+CZIP is ~900x faster than llama-zip and ~47x faster than ts_zip, running on CPU alone.
 
 ### Architecture
 
