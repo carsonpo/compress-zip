@@ -26,7 +26,7 @@ Wikipedia articles (~15KB each):
 
 | Compressor | Model | Compression | Speed | Hardware |
 |------------|-------|-------------|-------|----------|
-| **CZIP** | tiny GPT model | 3.4-3.9x | ~28,000 tok/s | CPU |
+| **CZIP** | tiny GPT model | 3.4-3.9x | ~350k tok/s | CPU (Mac Studio) |
 | [ts_zip](https://bellard.org/ts_zip/) | RWKV 169M | ~7x | ~577 tok/s | RTX 4090 GPU |
 | [llama-zip](https://github.com/alexbuz/llama-zip) | Llama 3.1 8B | 8-29x | ~30 tok/s | GPU |
 
