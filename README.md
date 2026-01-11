@@ -67,20 +67,20 @@ pip install -e ".[dev]"
 
 ```bash
 # Rust
-./target/release/compress_zip compress -m model.safetensors -i input.txt -o output.czip
+./target/release/compress_zip compress -m models/v000_eng.czm -i input.txt -o output.czip
 
 # Python
-python -m compress_zip compress -m model.safetensors -i input.txt -o output.czip
+python -m compress_zip compress -m models/v000_eng.czm -i input.txt -o output.czip
 ```
 
 ### Decompress
 
 ```bash
 # Rust
-./target/release/compress_zip decompress -m model.safetensors -i output.czip -o recovered.txt
+./target/release/compress_zip decompress -m models/v000_eng.czm -i output.czip -o recovered.txt
 
 # Python
-python -m compress_zip decompress -m model.safetensors -i output.czip -o recovered.txt
+python -m compress_zip decompress -m models/v000_eng.czm -i output.czip -o recovered.txt
 ```
 
 ### Options
