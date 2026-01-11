@@ -15,9 +15,9 @@ from typing import List, Optional, Dict, Any
 from .attention import gqa_attention_mqa_i8, gqa_attention_mqa_i8_cached, apply_rope_i8, KVCache, HEAD_DIM, MAX_SEQ_LEN
 from .linear import linear_i8_to_i32
 from .lut import get_exp2_lut, get_rope_lut
-from .primitives import clamp_i8, sra_rne_tte_s32
+from .primitives import clamp_i8, sra_rne_tte_s32, sra_rne_tte_s64_to_s32
 from .reglu import reglu_i8
-from .rmsnorm import rmsnorm_i8_int
+from .rmsnorm import rmsnorm_i8
 from .softmax_cdf import build_cumfreqs
 
 try:
@@ -81,8 +81,8 @@ class ModelConfig:
 @dataclass
 class LayerWeights:
     """Transformer layer weights (czip-model-v1 integer-only format)."""
-    # Pre-attention norm (Q1.14)
-    attn_norm: np.ndarray       # [d_model] int16
+    # Pre-attention norm (Q0.7 int8 - matches Rust)
+    attn_norm: np.ndarray       # [d_model] int8
 
     # Attention
     qkv_weight: np.ndarray      # [d_model + 2*kv_dim, d_model] int8
@@ -91,14 +91,14 @@ class LayerWeights:
     out_weight: np.ndarray      # [d_model, d_model] int8
     out_mult: np.int32          # scalar
     out_shift: np.int8          # scalar
-    score_mult: np.ndarray      # [n_heads] int16 (Q0.15)
+    score_mult: np.ndarray      # [n_heads] int32 (Q0.15 stored as i32)
     score_shift: np.int8        # scalar
 
-    # Post-attention norm (Q1.14)
-    post_attn_norm: np.ndarray  # [d_model] int16
+    # Post-attention norm (Q0.7 int8)
+    post_attn_norm: np.ndarray  # [d_model] int8
 
-    # Pre-FFN norm (Q1.14)
-    ffn_norm: np.ndarray        # [d_model] int16
+    # Pre-FFN norm (Q0.7 int8)
+    ffn_norm: np.ndarray        # [d_model] int8
 
     # FFN
     up_weight: np.ndarray       # [2*d_ff, d_model] int8 (gate+up combined)
@@ -108,8 +108,8 @@ class LayerWeights:
     down_mult: np.int32         # scalar
     down_shift: np.int8         # scalar
 
-    # Post-FFN norm (Q1.14)
-    post_ffn_norm: np.ndarray   # [d_model] int16
+    # Post-FFN norm (Q0.7 int8)
+    post_ffn_norm: np.ndarray   # [d_model] int8
 
 
 @dataclass
@@ -118,7 +118,7 @@ class ModelWeights:
     config: ModelConfig
     embedding: np.ndarray       # [vocab_size, d_model] int8
     layers: List[LayerWeights]
-    final_norm: np.ndarray      # [d_model] int16 (Q1.14)
+    final_norm: np.ndarray      # [d_model] int8 (Q0.7)
     head_weight: np.ndarray     # [vocab_size, d_model] int8
     head_mult: np.int32         # scalar
     head_shift: np.int8         # scalar
@@ -127,6 +127,9 @@ class ModelWeights:
     exp2_lut: Optional[np.ndarray] = None      # [256] uint16
     rope_cos_lut: Optional[np.ndarray] = None  # [max_seq_len, half_dim] int16
     rope_sin_lut: Optional[np.ndarray] = None  # [max_seq_len, half_dim] int16
+    # Softmax CDF constants for bit-exactness
+    coef_q24: Optional[int] = None             # Coefficient for exp scaling
+    target_total: Optional[int] = None         # Target total for frequency table
 
     @classmethod
     def load(cls, path: Path | str, config: Optional[ModelConfig] = None) -> "ModelWeights":
@@ -178,15 +181,21 @@ class ModelWeights:
             # Load embedding
             embedding = ensure_i8(get_tensor("embed.weight"))
 
+            def ensure_i32(tensor: np.ndarray) -> np.ndarray:
+                """Ensure tensor is int32."""
+                if tensor.dtype != np.int32:
+                    return tensor.astype(np.int32)
+                return tensor
+
             # Load layers
             layers = []
             for i in range(config.n_layers):
                 layer = LayerWeights(
-                    # Norms (int16 Q1.14)
-                    attn_norm=ensure_i16(get_tensor(f"layers.{i}.attn_norm.weight")),
-                    post_attn_norm=ensure_i16(get_tensor(f"layers.{i}.post_attn_norm.weight")),
-                    ffn_norm=ensure_i16(get_tensor(f"layers.{i}.ffn_norm.weight")),
-                    post_ffn_norm=ensure_i16(get_tensor(f"layers.{i}.post_ffn_norm.weight")),
+                    # Norms (int8 Q0.7 - matches Rust)
+                    attn_norm=ensure_i8(get_tensor(f"layers.{i}.attn_norm.weight")),
+                    post_attn_norm=ensure_i8(get_tensor(f"layers.{i}.post_attn_norm.weight")),
+                    ffn_norm=ensure_i8(get_tensor(f"layers.{i}.ffn_norm.weight")),
+                    post_ffn_norm=ensure_i8(get_tensor(f"layers.{i}.post_ffn_norm.weight")),
 
                     # Attention
                     qkv_weight=ensure_i8(get_tensor(f"layers.{i}.attn.qkv.weight")),
@@ -195,7 +204,7 @@ class ModelWeights:
                     out_weight=ensure_i8(get_tensor(f"layers.{i}.attn.out.weight")),
                     out_mult=get_scalar_i32(f"layers.{i}.attn.out.mult"),
                     out_shift=get_scalar_i8(f"layers.{i}.attn.out.shift"),
-                    score_mult=ensure_i16(get_tensor(f"layers.{i}.attn.score_mult")),
+                    score_mult=ensure_i32(get_tensor(f"layers.{i}.attn.score_mult")),
                     score_shift=get_scalar_i8(f"layers.{i}.attn.score_shift", 15),
 
                     # FFN
@@ -209,7 +218,7 @@ class ModelWeights:
                 layers.append(layer)
 
             # Load final norm and head
-            final_norm = ensure_i16(get_tensor("norm.weight"))
+            final_norm = ensure_i8(get_tensor("norm.weight"))
             head_weight = ensure_i8(get_tensor("head.weight"))
             head_mult = get_scalar_i32("head.mult")
             head_shift = get_scalar_i8("head.shift")
@@ -243,6 +252,14 @@ class ModelWeights:
             if "lut.rope_sin" in f.keys():
                 rope_sin_lut = f.get_tensor("lut.rope_sin").astype(np.int16)
 
+            # Load softmax CDF constants for bit-exactness
+            coef_q24 = None
+            target_total = None
+            if "softmax.coef_q24" in f.keys():
+                coef_q24 = int(f.get_tensor("softmax.coef_q24"))
+            if "softmax.target_total" in f.keys():
+                target_total = int(f.get_tensor("softmax.target_total"))
+
             return cls(
                 config=config,
                 embedding=embedding,
@@ -255,35 +272,35 @@ class ModelWeights:
                 exp2_lut=exp2_lut,
                 rope_cos_lut=rope_cos_lut,
                 rope_sin_lut=rope_sin_lut,
+                coef_q24=coef_q24,
+                target_total=target_total,
             )
 
 
 def requantize_i32_to_i8(x: np.ndarray, mult: np.int32, shift: np.int8) -> np.ndarray:
-    """Requantize int32 accumulator to int8 using shift-multiply.
+    """Requantize int32 accumulator to int8 using shift-multiply with ties-to-even.
 
-    Uses arithmetic right shift with round-to-nearest (tie-to-even for consistency,
-    but we use tie-to-away for simplicity which is common in quantized inference).
+    Uses arithmetic right shift with round-to-nearest-even, matching CUDA's
+    sra_round_ties_to_even_s64_to_s32 exactly.
 
-    output = clamp((x * mult + (1 << (shift-1))) >> shift, -127, 127)
+    output = clamp(sra_rne_tte(x * mult, shift), -127, 127)
     """
     if shift <= 0:
         # No shift, just multiply and clamp
         result = x.astype(np.int64) * int(mult)
         return np.clip(result, -127, 127).astype(np.int8)
 
-    # Widen to int64 for intermediate computation
-    x64 = x.astype(np.int64)
-    mult64 = np.int64(mult)
+    # Apply element-wise: multiply then shift with ties-to-even
+    result = np.zeros(x.shape, dtype=np.int8)
+    mult64 = int(mult)
+    shift_int = int(shift)
 
-    # Multiply
-    product = x64 * mult64
+    for i in range(len(x)):
+        product = int(x[i]) * mult64
+        rounded = sra_rne_tte_s64_to_s32(product, shift_int)
+        result[i] = max(-127, min(127, rounded))
 
-    # Round-to-nearest with tie-to-away (add half, then shift)
-    half = np.int64(1) << (int(shift) - 1)
-    rounded = (product + half) >> int(shift)
-
-    # Clamp to int8 range (symmetric: -127 to 127)
-    return np.clip(rounded, -127, 127).astype(np.int8)
+    return result
 
 
 class Model:
@@ -314,6 +331,11 @@ class Model:
             self.rope_cos_lut = cos_lut
             self.rope_sin_lut = sin_lut
 
+        # Use embedded softmax constants for bit-exactness, fall back to computed if not present
+        from .softmax_cdf import compute_coef_q24, compute_target_total
+        self.coef_q24 = weights.coef_q24 if weights.coef_q24 is not None else compute_coef_q24()
+        self.target_total = weights.target_total if weights.target_total is not None else compute_target_total(self.config.vocab_size)
+
     def reset(self):
         """Reset KV caches for new sequence."""
         self.kv_caches = [
@@ -322,20 +344,29 @@ class Model:
         ]
 
     def forward(self, token: int, pos: int) -> np.ndarray:
-        """Forward pass for a single token, returns logits."""
+        """Forward pass for a single token, returns logits.
+
+        Architecture: sandwich norms (pre + post norm for each sublayer)
+        Matches CUDA/Rust: attn_out = attn(norm1(x)); x = x + norm3(attn_out)
+                          mlp_out = mlp(norm2(x)); x = x + norm4(mlp_out)
+        Mapping: norm1=attn_norm, norm2=post_attn_norm, norm3=ffn_norm, norm4=post_ffn_norm
+        """
         d = self.config.d_model
         d_ff = self.config.d_ff
         n_heads = self.config.n_heads
         head_dim = self.config.head_dim
         kv_dim = self.config.n_kv_heads * head_dim
 
-        # Embedding lookup (int8)
-        x = self.weights.embedding[token].copy()
+        # Embedding lookup (int8) -> promote to int32 for residual stream
+        # CUDA keeps residual as int32 throughout, only clamping when feeding into norms
+        x = self.weights.embedding[token].astype(np.int32)
 
         # Process each layer
         for layer_idx, layer in enumerate(self.weights.layers):
-            # Pre-attention norm (int16 Q1.14 weights)
-            normed = rmsnorm_i8_int(x, layer.attn_norm)
+            # Pre-attention norm (norm1 = attn_norm)
+            # Clamp int32 residual to int8 before norm
+            x_i8 = np.array([clamp_i8(v) for v in x], dtype=np.int8)
+            normed = rmsnorm_i8(x_i8, layer.attn_norm)
 
             # QKV projection (combined)
             # qkv_weight shape: [d_model + 2*kv_dim, d_model]
@@ -350,9 +381,6 @@ class Model:
             q = requantize_i32_to_i8(q_i32, layer.qkv_mult, layer.qkv_shift)
             k = requantize_i32_to_i8(k_i32, layer.qkv_mult, layer.qkv_shift)
             v = requantize_i32_to_i8(v_i32, layer.qkv_mult, layer.qkv_shift)
-
-            # Post-QKV norm (int16 Q1.14 weights)
-            q = rmsnorm_i8_int(q, layer.post_attn_norm)
 
             # Multi-head attention with MQA
             # First, update KV cache with current K/V (only once, before heads loop)
@@ -395,11 +423,18 @@ class Model:
             o_i32 = linear_i8_to_i32(attn_out, layer.out_weight)
             o = requantize_i32_to_i8(o_i32, layer.out_mult, layer.out_shift)
 
-            # Residual (int8 + int8 -> int8 with clamp)
-            x = np.array([clamp_i8(int(x[i]) + int(o[i])) for i in range(d)], dtype=np.int8)
+            # Post-attention norm (norm3 = ffn_norm in conversion naming)
+            # Applied to attention output BEFORE residual add
+            o_normed = rmsnorm_i8(o, layer.ffn_norm)
 
-            # Pre-FFN norm (int16 Q1.14 weights)
-            normed_ffn = rmsnorm_i8_int(x, layer.ffn_norm)
+            # Residual add - keep as int32 (no clamp, matches CUDA residual_add_i8)
+            for i in range(d):
+                x[i] = x[i] + int(o_normed[i])
+
+            # Pre-FFN norm (norm2 = post_attn_norm in conversion naming)
+            # Clamp int32 residual to int8 before norm
+            x_i8_ffn = np.array([clamp_i8(v) for v in x], dtype=np.int8)
+            normed_ffn = rmsnorm_i8(x_i8_ffn, layer.post_attn_norm)
 
             # FFN: combined gate+up projection
             # up_weight shape: [2*d_ff, d_model]
@@ -419,14 +454,17 @@ class Model:
             down_i32 = linear_i8_to_i32(gated, layer.down_weight)
             down = requantize_i32_to_i8(down_i32, layer.down_mult, layer.down_shift)
 
-            # Post-FFN norm (applied after down projection, int16 Q1.14 weights)
-            down = rmsnorm_i8_int(down, layer.post_ffn_norm)
+            # Post-FFN norm (norm4 = post_ffn_norm)
+            down_normed = rmsnorm_i8(down, layer.post_ffn_norm)
 
-            # Residual
-            x = np.array([clamp_i8(int(x[i]) + int(down[i])) for i in range(d)], dtype=np.int8)
+            # Residual add - keep as int32 (no clamp, matches CUDA residual_add_i8)
+            for i in range(d):
+                x[i] = x[i] + int(down_normed[i])
 
-        # Final norm (int16 Q1.14 weights)
-        final_normed = rmsnorm_i8_int(x, self.weights.final_norm)
+        # Final norm (int8 Q0.7 weights)
+        # Clamp int32 residual to int8 before norm
+        x_i8_final = np.array([clamp_i8(v) for v in x], dtype=np.int8)
+        final_normed = rmsnorm_i8(x_i8_final, self.weights.final_norm)
 
         # LM head - returns int32 logits (not requantized for softmax)
         logits = linear_i8_to_i32(final_normed, self.weights.head_weight)
@@ -438,7 +476,12 @@ class Model:
 
         Returns inclusive cumfreqs (no leading 0) matching CUDA.
         """
-        return build_cumfreqs(logits, exp_lut=self.exp_lut)
+        return build_cumfreqs(
+            logits,
+            exp_lut=self.exp_lut,
+            coef_q24=self.coef_q24,
+            target_total=self.target_total,
+        )
 
     def get_tokenizer(self) -> Optional[dict]:
         """Get embedded tokenizer if present."""

@@ -30,47 +30,6 @@ def linear_i8_to_i32(
         x = x.reshape(1, -1)
         squeeze = True
 
-    batch_size, in_features = x.shape
-    out_features, weight_in = weight.shape
-
-    assert weight_in == in_features, f"Weight in_features {weight_in} != x in_features {in_features}"
-
-    # Convert to int32 for accumulation
-    x_i32 = x.astype(np.int32)
-    weight_i32 = weight.astype(np.int32)
-
-    # Matrix multiply
-    output = np.zeros((batch_size, out_features), dtype=np.int32)
-
-    for b in range(batch_size):
-        for o in range(out_features):
-            acc = 0
-            for i in range(in_features):
-                acc += x_i32[b, i] * weight_i32[o, i]
-            output[b, o] = acc
-
-    # Add bias if provided
-    if bias is not None:
-        output += bias.astype(np.int32)
-
-    if squeeze:
-        return output[0]
-    return output
-
-
-def linear_i8_to_i32_vectorized(
-    x: np.ndarray,
-    weight: np.ndarray,
-    bias: np.ndarray | None = None,
-) -> np.ndarray:
-    """
-    Vectorized int8 linear layer (faster, bit-exact for integer ops).
-    """
-    squeeze = False
-    if x.ndim == 1:
-        x = x.reshape(1, -1)
-        squeeze = True
-
     # Convert to int32 for accumulation
     x_i32 = x.astype(np.int32)
     weight_i32 = weight.astype(np.int32)
@@ -109,9 +68,5 @@ if __name__ == "__main__":
     result_with_bias = linear_i8_to_i32(x, weight, bias)
     assert result_with_bias[0, 0] == 8292, f"Expected 8292, got {result_with_bias[0, 0]}"
     assert result_with_bias[0, 1] == 4296, f"Expected 4296, got {result_with_bias[0, 1]}"
-
-    # Verify vectorized matches
-    result_vec = linear_i8_to_i32_vectorized(x, weight)
-    assert np.array_equal(result, result_vec), "Vectorized doesn't match scalar"
 
     print("All linear tests passed!")

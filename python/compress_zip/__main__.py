@@ -143,8 +143,8 @@ def compress(
             pos = i
 
             # Get model prediction (logits)
-            # First token in chunk uses BOS (0), otherwise previous token in chunk
-            prev_token = 0 if i == 0 else chunk_tokens[i - 1]
+            # First token in chunk uses BOS (1022), otherwise previous token in chunk
+            prev_token = 1022 if i == 0 else chunk_tokens[i - 1]
             logits = model.forward(prev_token, pos)
 
             # Convert to cumulative frequencies
@@ -243,8 +243,8 @@ def decompress(
             pos = i
 
             # Get model prediction
-            # First token in chunk uses BOS (0), otherwise previous token in this chunk
-            prev_token = 0 if i == 0 else chunk_decoded[i - 1]
+            # First token in chunk uses BOS (1022), otherwise previous token in this chunk
+            prev_token = 1022 if i == 0 else chunk_decoded[i - 1]
             logits = model.forward(prev_token, pos)
 
             # Convert to cumulative frequencies
@@ -302,9 +302,9 @@ def main():
                                   help="Input text file")
     compress_parser.add_argument("-o", "--output", type=Path, required=True,
                                   help="Output compressed file")
-    compress_parser.add_argument("-c", "--codec", type=str, default="zstd",
+    compress_parser.add_argument("-c", "--codec", type=str, default="brotli",
                                   choices=["zstd", "brotli"],
-                                  help="Compression codec (default: zstd)")
+                                  help="Compression codec (default: brotli)")
 
     # Decompress command
     decompress_parser = subparsers.add_parser("decompress", help="Decompress a compressed file")

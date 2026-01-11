@@ -8,7 +8,7 @@ import numpy as np
 from typing import Optional
 from dataclasses import dataclass
 
-from .primitives import sra_rne_tte_s32, sra_rne_tte_s64_to_s32, clamp_i8, div_rne_tte_s64_to_s32
+from .primitives import sra_rne_tte_s32, sra_rne_tte_s64_to_s32, clamp_i8, div_rne_tte_s64_to_s32, sra_rne_tte_s32_np
 from .lut import get_rope_lut, get_exp2_lut, ROPE_HALF_DIM
 
 # Constants matching CUDA attention.cu
@@ -251,29 +251,25 @@ def gqa_attention_mqa_i8(
         k_cache = k_rot.reshape(1, -1)
         v_cache = v.reshape(1, -1)
 
-    # Compute attention scores matching CUDA exactly
-    scores = []
-    for t in range(seq_len):
-        # Q*K dot product
-        dot = 0
-        for d in range(HEAD_DIM):
-            dot += int(q_rot[d]) * int(k_cache[t, d])
+    # Compute attention scores matching CUDA exactly (vectorized)
+    q_rot_64 = q_rot.astype(np.int64)
+    k_cache_64 = k_cache.astype(np.int64)
+    dots = np.sum(q_rot_64 * k_cache_64, axis=1)  # [seq_len]
 
-        # CUDA: dot_unshift = round(dot >> Q_SHIFT)
-        dot_unshift = sra_rne_tte_s32(dot, Q_SHIFT)
+    # CUDA: dot_unshift = round(dot >> Q_SHIFT) with ties-to-even
+    dots_unshift = sra_rne_tte_s32_np(dots, Q_SHIFT)
 
-        # CUDA: prod = dot_unshift * score_mul; score = round(prod >> 15)
-        prod = dot_unshift * score_mul_q15
-        score = sra_rne_tte_s64_to_s32(prod, 15)
-        scores.append(score)
+    # CUDA: prod = dot_unshift * score_mul; score = round(prod >> 15) with ties-to-even
+    prods = dots_unshift.astype(np.int64) * score_mul_q15
+    scores = np.array([sra_rne_tte_s64_to_s32(int(p), 15) for p in prods])
 
     # Online softmax (matching CUDA)
     m = -(1 << 30)  # Running max (use large negative instead of INT32_MIN)
     s = 0  # Running sum of exp weights (uint64)
-    vacc = [0] * HEAD_DIM  # Weighted V accumulator (int64)
+    vacc = np.zeros(HEAD_DIM, dtype=np.int64)  # Weighted V accumulator
 
     for t in range(seq_len):
-        score = scores[t]
+        score = int(scores[t])
 
         # Update online softmax
         if score > m:
@@ -283,14 +279,10 @@ def gqa_attention_mqa_i8(
                 scale_old = exp_q16_from_attn_diff(diff_old, exp_lut)
                 # Rescale S: (S * scale + 0x8000) >> 16
                 s = (s * scale_old + 0x8000) >> 16
-                # Rescale vacc
-                for i in range(HEAD_DIM):
-                    prod = vacc[i] * scale_old
-                    # Symmetric rounding
-                    if prod >= 0:
-                        vacc[i] = (prod + (1 << 15)) >> 16
-                    else:
-                        vacc[i] = -((-prod + (1 << 15)) >> 16)
+                # Rescale vacc (vectorized, matching CUDA exactly)
+                prod = vacc * scale_old
+                adjustment = np.where(prod >= 0, 1 << 15, -(1 << 15))
+                vacc = (prod + adjustment) >> 16
             m = score
 
         # Compute exp weight for this token
@@ -298,17 +290,17 @@ def gqa_attention_mqa_i8(
         w = exp_q16_from_attn_diff(diff, exp_lut)
         s += w
 
-        # Accumulate weighted V
-        for i in range(HEAD_DIM):
-            vacc[i] += w * int(v_cache[t, i])
+        # Accumulate weighted V (vectorized)
+        vacc += w * v_cache[t].astype(np.int64)
 
     # Normalize output
     denom = s if s != 0 else 1
-    output = np.zeros(HEAD_DIM, dtype=np.int8)
 
+    # Vectorized output computation
+    y = np.zeros(HEAD_DIM, dtype=np.int64)
     for i in range(HEAD_DIM):
-        y = div_rne_tte_s64_to_s32(vacc[i], denom)
-        output[i] = clamp_i8(y)
+        y[i] = div_rne_tte_s64_to_s32(int(vacc[i]), denom)
+    output = np.clip(y, -128, 127).astype(np.int8)
 
     return output
 
@@ -350,56 +342,53 @@ def gqa_attention_mqa_i8_cached(
 
     seq_len = pos + 1
 
-    # Compute attention scores matching CUDA exactly
-    scores = []
-    for t in range(seq_len):
-        # Q*K dot product
-        dot = 0
-        for d in range(HEAD_DIM):
-            dot += int(q_rot[d]) * int(k_cache[t, d])
+    # Compute attention scores matching CUDA exactly (vectorized)
+    # Q*K dot products for all positions at once
+    q_rot_64 = q_rot.astype(np.int64)
+    k_cache_64 = k_cache[:seq_len].astype(np.int64)
+    dots = np.sum(q_rot_64 * k_cache_64, axis=1)  # [seq_len]
 
-        # CUDA: dot_unshift = round(dot >> Q_SHIFT)
-        dot_unshift = sra_rne_tte_s32(dot, Q_SHIFT)
+    # CUDA: dot_unshift = round(dot >> Q_SHIFT) with ties-to-even
+    dots_unshift = sra_rne_tte_s32_np(dots, Q_SHIFT)
 
-        # CUDA: prod = dot_unshift * score_mul; score = round(prod >> 15)
-        prod = dot_unshift * score_mul_q15
-        score = sra_rne_tte_s64_to_s32(prod, 15)
-        scores.append(score)
+    # CUDA: prod = dot_unshift * score_mul; score = round(prod >> 15) with ties-to-even
+    prods = dots_unshift.astype(np.int64) * score_mul_q15
+    # For 64-bit values, process element-wise to ensure correct rounding
+    scores = np.array([sra_rne_tte_s64_to_s32(int(p), 15) for p in prods])
 
     # Online softmax (matching CUDA)
     m = -(1 << 30)
     s = 0
-    vacc = [0] * HEAD_DIM
+    vacc = np.zeros(HEAD_DIM, dtype=np.int64)
 
     for t in range(seq_len):
-        score = scores[t]
+        score = int(scores[t])
 
         if score > m:
             if m != -(1 << 30):
                 diff_old = m - score
                 scale_old = exp_q16_from_attn_diff(diff_old, exp_lut)
                 s = (s * scale_old + 0x8000) >> 16
-                for i in range(HEAD_DIM):
-                    prod = vacc[i] * scale_old
-                    if prod >= 0:
-                        vacc[i] = (prod + (1 << 15)) >> 16
-                    else:
-                        vacc[i] = -((-prod + (1 << 15)) >> 16)
+                # Vectorized vacc rescaling matching CUDA
+                prod = vacc * scale_old
+                adjustment = np.where(prod >= 0, 1 << 15, -(1 << 15))
+                vacc = (prod + adjustment) >> 16
             m = score
 
         diff = score - m
         w = exp_q16_from_attn_diff(diff, exp_lut)
         s += w
 
-        for i in range(HEAD_DIM):
-            vacc[i] += w * int(v_cache[t, i])
+        vacc += w * v_cache[t].astype(np.int64)
 
     denom = s if s != 0 else 1
-    output = np.zeros(HEAD_DIM, dtype=np.int8)
 
+    # Vectorized output computation
+    vacc_arr = vacc.astype(np.int64)
+    y = np.zeros(HEAD_DIM, dtype=np.int64)
     for i in range(HEAD_DIM):
-        y = div_rne_tte_s64_to_s32(vacc[i], denom)
-        output[i] = clamp_i8(y)
+        y[i] = div_rne_tte_s64_to_s32(int(vacc_arr[i]), denom)
+    output = np.clip(y, -128, 127).astype(np.int8)
 
     return output
 

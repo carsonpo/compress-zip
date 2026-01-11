@@ -16,13 +16,20 @@ Wikipedia articles (~15KB each):
 
 | Article | Original | CZIP | brotli-11 | zstd-22 | gzip-9 |
 |---------|----------|------|-----------|---------|--------|
-| Machine Learning | 15,003 | **3,932 (3.82x)** | 4,303 (3.49x) | 5,541 (2.71x) | 5,783 (2.59x) |
-| World War II | 15,024 | **4,388 (3.42x)** | 4,729 (3.18x) | 5,914 (2.54x) | 6,139 (2.45x) |
-| Python (PL) | 15,020 | **4,410 (3.41x)** | 4,670 (3.22x) | 5,852 (2.57x) | 6,079 (2.47x) |
-| Einstein | 15,038 | **4,448 (3.38x)** | 4,920 (3.06x) | 6,306 (2.38x) | 6,546 (2.30x) |
-| Rust (PL) | 15,014 | **4,545 (3.30x)** | 4,727 (3.18x) | 6,001 (2.50x) | 6,217 (2.41x) |
+| Machine Learning | 15,003 | **3,876 (3.87x)** | 4,303 (3.49x) | 5,541 (2.71x) | 5,783 (2.59x) |
+| World War II | 15,024 | **4,316 (3.48x)** | 4,729 (3.18x) | 5,914 (2.54x) | 6,139 (2.45x) |
+| Python (PL) | 15,020 | **4,336 (3.46x)** | 4,670 (3.22x) | 5,852 (2.57x) | 6,079 (2.47x) |
+| Einstein | 15,038 | **4,392 (3.42x)** | 4,920 (3.06x) | 6,306 (2.38x) | 6,546 (2.30x) |
+| Rust (PL) | 15,014 | **4,447 (3.38x)** | 4,727 (3.18x) | 6,001 (2.50x) | 6,217 (2.41x) |
 
-CPU throughput: ~27,000 tokens/sec (Rust with rayon, AMD EPYC 9354)
+### Comparison with Other Neural Compressors
+
+| Compressor | Model | Compression | Speed | Hardware |
+|------------|-------|-------------|-------|----------|
+| **CZIP** | tiny GPT model | 3.4-3.9x | ~28,000 tok/s | CPU |
+| [ts_zip](https://bellard.org/ts_zip/) | RWKV 169M | ~7x | ~577 tok/s | RTX 4090 GPU |
+| [llama-zip](https://github.com/alexbuz/llama-zip) | Llama 3.1 8B | 8-29x | ~30 tok/s | GPU |
+
 
 ## How it works
 
@@ -80,15 +87,13 @@ python -m compress_zip decompress -m model.safetensors -i output.czip -o recover
 
 - `-m, --model` — Path to model file (safetensors format)
 - `-t, --tokenizer` — Tokenizer path (default: uses tokenizer embedded in model)
-- `-c, --codec` — Outer compression: `zstd` (default) or `brotli`
+- `-c, --codec` — Outer compression: `brotli` (default) or `zstd`
 
 ## Running Tests
 
 ```bash
-# Rust (expects 40 passed)
 cd rust && cargo test
 
-# Python (expects 66 passed)
 cd python && pytest tests/ -v
 ```
 

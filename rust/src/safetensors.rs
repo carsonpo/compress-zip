@@ -1,3 +1,16 @@
+//! Minimal safetensors loader for czip-model-v1 format.
+//!
+//! This implementation is heavily adapted from the official safetensors library:
+//! https://github.com/huggingface/safetensors
+//!
+//! The original safetensors library is licensed under Apache License 2.0.
+//! This stripped-down version retains only the functionality needed for loading
+//! integer-quantized model weights. It is not a general-purpose safetensors
+//! implementation and should not be used as a replacement for the official library.
+//!
+//! Original copyright: Copyright 2022 The HuggingFace Team. All rights reserved.
+//! SPDX-License-Identifier: Apache-2.0
+
 use half::f16;
 use memmap2::MmapOptions;
 use serde::{Deserialize, Serialize};
@@ -22,6 +35,7 @@ pub enum DType {
     Int64,
     UInt8,
     UInt16,
+    UInt32,
     FP16,
     BF16,
     FP32,
@@ -41,6 +55,7 @@ impl DType {
             DType::Int64 => 8,
             DType::UInt8 => 1,
             DType::UInt16 => 2,
+            DType::UInt32 => 4,
             DType::FP16 => 2,
             DType::BF16 => 2,
             DType::FP32 => 4,
@@ -120,6 +135,12 @@ impl Tensor {
     pub fn as_i32(&self) -> &[i32] {
         assert_eq!(self.dtype, DType::Int32);
         unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const i32, self.num_elements()) }
+    }
+
+    /// Get data as u32 slice (only valid for UInt32 dtype)
+    pub fn as_u32(&self) -> &[u32] {
+        assert_eq!(self.dtype, DType::UInt32);
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const u32, self.num_elements()) }
     }
 
     /// Get data as f16 slice (only valid for FP16 dtype)
@@ -209,6 +230,7 @@ fn get_tensor_dtype(dtype_str: &str) -> Result<DType> {
         "BOOL" | "I32" => Ok(DType::Int32),
         "I64" => Ok(DType::Int64),
         "U8" => Ok(DType::UInt8),
+        "U32" => Ok(DType::UInt32),
         "U16" => Ok(DType::UInt16),
         "F16" => Ok(DType::FP16),
         "BF16" => Ok(DType::BF16),
@@ -228,6 +250,7 @@ fn get_safetensors_dtype(dtype: DType) -> Result<&'static str> {
         DType::Int64 => Ok("I64"),
         DType::UInt8 => Ok("U8"),
         DType::UInt16 => Ok("U16"),
+        DType::UInt32 => Ok("U32"),
         DType::FP16 => Ok("F16"),
         DType::BF16 => Ok("BF16"),
         DType::FP32 => Ok("F32"),

@@ -95,6 +95,9 @@ pub struct ModelWeights {
     pub exp2_lut: Vec<u16>,                // [256] uint16
     pub rope_cos_lut: Vec<i16>,            // [max_seq_len, half_dim] int16
     pub rope_sin_lut: Vec<i16>,            // [max_seq_len, half_dim] int16
+    // Softmax CDF constants for bit-exactness
+    pub coef_q24: Option<u32>,             // Coefficient for exp scaling
+    pub target_total: Option<u32>,         // Target total for frequency table
 }
 
 impl ModelWeights {
@@ -227,6 +230,12 @@ impl ModelWeights {
         let rope_cos_lut = to_i16_vec(get_tensor("lut.rope_cos")?);
         let rope_sin_lut = to_i16_vec(get_tensor("lut.rope_sin")?);
 
+        // Load softmax CDF constants (optional, fall back to computed values)
+        let coef_q24 = tensors.get("softmax.coef_q24")
+            .map(|t| t.as_u32()[0]);
+        let target_total = tensors.get("softmax.target_total")
+            .map(|t| t.as_u32()[0]);
+
         Ok(Self {
             config,
             embedding,
@@ -240,6 +249,8 @@ impl ModelWeights {
             exp2_lut,
             rope_cos_lut,
             rope_sin_lut,
+            coef_q24,
+            target_total,
         })
     }
 }
@@ -296,9 +307,9 @@ impl Model {
         let rope_lut = RopeLut::from_arrays(&weights.rope_cos_lut, &weights.rope_sin_lut)
             .expect("Invalid RoPE LUT in model weights");
 
-        // Compute coefficients for softmax (using a reasonable default)
-        let coef_q24 = compute_coef_q24_for_acc(128.0);
-        let target_total = compute_target_total(config.vocab_size);
+        // Use embedded constants for bit-exactness, fall back to computed if not present
+        let coef_q24 = weights.coef_q24.unwrap_or_else(|| compute_coef_q24_for_acc(128.0));
+        let target_total = weights.target_total.unwrap_or_else(|| compute_target_total(config.vocab_size));
 
         // Compute eps_scaled for rmsnorm (1e-5 is standard)
         let eps_scaled = compute_eps_scaled(1e-5);

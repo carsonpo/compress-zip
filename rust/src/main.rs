@@ -7,10 +7,9 @@ use compress_zip::arith_coder::{ArithDecoder, ArithEncoder};
 use compress_zip::file_format::{CompressedFile, Codec, CZIPv1OuterHeader, TOKENS_PER_CHUNK};
 use compress_zip::model::{Model, ModelWeights};
 use compress_zip::tiktoken::{load_tiktoken_json_tokenizer, load_tiktoken_json_from_bytes};
+use md5::{Md5, Digest};
 use rayon::prelude::*;
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,7 +44,7 @@ enum Commands {
         output: PathBuf,
 
         /// Compression codec (zstd or brotli)
-        #[arg(short, long, default_value = "zstd")]
+        #[arg(short, long, default_value = "brotli")]
         codec: String,
     },
     /// Decompress a compressed file
@@ -69,10 +68,14 @@ enum Commands {
 }
 
 /// Hash model path for model_id_hash field
+/// Uses MD5 hash to match Python implementation:
+///   int(hashlib.md5(str(path).encode()).hexdigest()[:8], 16)
 fn hash_model_path(path: &PathBuf) -> u32 {
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    (hasher.finish() & 0xFFFFFFFF) as u32
+    let path_str = path.to_string_lossy();
+    let hash = Md5::digest(path_str.as_bytes());
+    // Take first 8 hex characters (4 bytes) and interpret as u32
+    let hex_str = format!("{:x}", hash);
+    u32::from_str_radix(&hex_str[..8], 16).unwrap_or(0)
 }
 
 /// Decompress tokenizer data using the specified codec
@@ -217,16 +220,17 @@ fn compress(
 
     let (outer_bytes, payload) = cf.to_bytes_uncompressed();
 
-    // Compress payload with zstd (or brotli based on codec)
+    // Compress payload with zstd or brotli based on codec
     let compressed_payload = match codec {
         Codec::Zstd => {
-            zstd::encode_all(std::io::Cursor::new(&payload), 3)
+            zstd::encode_all(std::io::Cursor::new(&payload), 22)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
         }
         Codec::Brotli => {
             let mut compressed = Vec::new();
             {
-                let mut encoder = brotli::CompressorWriter::new(&mut compressed, 4096, 6, 22);
+                // Quality 11, window size 22 to match Python
+                let mut encoder = brotli::CompressorWriter::new(&mut compressed, 4096, 11, 22);
                 encoder.write_all(&payload)?;
             }
             compressed

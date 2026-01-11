@@ -5,7 +5,7 @@ Matches CUDA reglu kernel in reglu.cu.
 """
 
 import numpy as np
-from .primitives import sra_rne_tte_s32, clamp_i8
+from .primitives import sra_rne_tte_s32_np
 
 
 def reglu_i8(gate: np.ndarray, value: np.ndarray) -> np.ndarray:
@@ -22,54 +22,17 @@ def reglu_i8(gate: np.ndarray, value: np.ndarray) -> np.ndarray:
     Returns:
         Output tensor as int8 (Q0.7)
     """
-    assert gate.shape == value.shape, "Gate and value must have same shape"
-
-    gate_i32 = gate.astype(np.int32)
-    value_i32 = value.astype(np.int32)
-
-    output = np.zeros_like(gate, dtype=np.int8)
-
-    # Flatten for iteration
-    gate_flat = gate_i32.flatten()
-    value_flat = value_i32.flatten()
-    output_flat = output.flatten()
-
-    for i in range(len(gate_flat)):
-        g = gate_flat[i]
-        v = value_flat[i]
-
-        # ReLU on gate
-        if g <= 0:
-            output_flat[i] = 0
-        else:
-            # g * v is Q0.14, shift by 7 to get Q0.7
-            product = g * v
-            result = sra_rne_tte_s32(product, 7)
-            output_flat[i] = clamp_i8(result)
-
-    return output_flat.reshape(gate.shape)
-
-
-def reglu_i8_vectorized(gate: np.ndarray, value: np.ndarray) -> np.ndarray:
-    """
-    Vectorized ReGLU (faster, but may have minor rounding differences).
-
-    For bit-exact results, use reglu_i8.
-    """
     gate_i32 = gate.astype(np.int32)
     value_i32 = value.astype(np.int32)
 
     # ReLU on gate
     gate_relu = np.maximum(gate_i32, 0)
 
-    # Product and shift
+    # Product and shift with ties-to-even rounding
     product = gate_relu * value_i32
+    result = sra_rne_tte_s32_np(product, 7)
 
-    # Simple rounding (not ties-to-even, but close enough for most cases)
-    # For bit-exact, need element-wise sra_rne_tte_s32
-    result = (product + 64) >> 7  # Add 0.5 in Q0.7 for rounding
-
-    return np.clip(result, -128, 127).astype(np.int8)
+    return np.clip(result, -127, 127).astype(np.int8)
 
 
 # Test cases

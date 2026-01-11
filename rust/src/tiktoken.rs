@@ -1,3 +1,16 @@
+//! Minimal BPE tokenizer for czip-model-v1 format.
+//!
+//! This implementation is heavily adapted from the official tiktoken library:
+//! https://github.com/openai/tiktoken
+//!
+//! The original tiktoken library is licensed under MIT License.
+//! This stripped-down version retains only the functionality needed for encoding
+//! and decoding text with a pre-trained BPE tokenizer. It is not a general-purpose
+//! tokenizer implementation and should not be used as a replacement for the official library.
+//!
+//! Original copyright: Copyright (c) 2022 OpenAI
+//! SPDX-License-Identifier: MIT
+
 use std::collections::HashSet;
 use std::fs;
 use std::num::NonZeroU64;

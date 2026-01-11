@@ -19,7 +19,16 @@ QUARTER_RANGE = 1 << (NUM_STATE_BITS - 2)  # 1 << 30 = 1073741824
 LOG2E = 1.4426950408889634
 W_CLIP = 0.1  # Must match lm_head weight clip in model
 COEF_D = (W_CLIP * LOG2E) / 64.0
-COEF_Q24 = int(COEF_D * (1 << 24) + 0.5)  # ~37817
+# Default COEF_Q24 using ties-to-even rounding (Python 3's round())
+DEFAULT_COEF_Q24 = round(COEF_D * (1 << 24))  # 37817
+
+
+def compute_coef_q24() -> int:
+    """Compute COEF_Q24 for softmax exp calculation.
+
+    Uses ties-to-even rounding for bit-exactness with Rust.
+    """
+    return max(1, round(COEF_D * (1 << 24)))
 
 
 def compute_target_total(vocab_size: int) -> int:
@@ -34,21 +43,25 @@ def compute_target_total(vocab_size: int) -> int:
     return target
 
 
-def exp_q16_from_diff_acc(diff: int, exp_lut) -> int:
+def exp_q16_from_diff_acc(diff: int, exp_lut, coef_q24: int = None) -> int:
     """
     Compute exp2 for logit difference (int32 GEMM accumulator).
     Matches CUDA exp_q16_from_diff_acc exactly.
 
     diff = logit - max_logit (<= 0)
+    coef_q24 = coefficient for scaling (default: DEFAULT_COEF_Q24)
     Returns uint16 Q16 representation.
     """
+    if coef_q24 is None:
+        coef_q24 = DEFAULT_COEF_Q24
+
     if diff >= 0:
         return 65535
 
     neg = -diff
 
-    # t256 = round(neg * COEF_Q24 / 2^24)
-    t256 = (neg * COEF_Q24 + (1 << 23)) >> 24
+    # t256 = round(neg * coef_q24 / 2^24)
+    t256 = (neg * coef_q24 + (1 << 23)) >> 24
 
     ip = t256 >> 8  # integer part
     frac = t256 & 255  # fractional part
@@ -76,6 +89,8 @@ def build_cumfreqs(
     logits: np.ndarray,
     vocab_size: int | None = None,
     exp_lut = None,
+    coef_q24: int | None = None,
+    target_total: int | None = None,
 ) -> Tuple[np.ndarray, int]:
     """
     Build cumulative frequency table from int32 logits.
@@ -93,6 +108,8 @@ def build_cumfreqs(
         logits: Int32 logits of shape [vocab_size]
         vocab_size: Optional vocab size (defaults to len(logits))
         exp_lut: Optional exp2 LUT (defaults to get_exp2_lut())
+        coef_q24: Optional coefficient for exp scaling (defaults to DEFAULT_COEF_Q24)
+        target_total: Optional target total for frequencies (defaults to compute_target_total(vocab_size))
 
     Returns:
         Tuple of (cumfreqs array of shape [vocab_size], target_total)
@@ -105,7 +122,10 @@ def build_cumfreqs(
 
     if exp_lut is None:
         exp_lut = get_exp2_lut()
-    target_total = compute_target_total(vocab_size)
+    if coef_q24 is None:
+        coef_q24 = DEFAULT_COEF_Q24
+    if target_total is None:
+        target_total = compute_target_total(vocab_size)
 
     # Pass 1: Find max logit
     max_val = int(np.max(logits[:vocab_size]))
@@ -119,7 +139,7 @@ def build_cumfreqs(
 
     for i in range(vocab_size):
         diff = int(logits[i]) - max_val  # <= 0
-        e = exp_q16_from_diff_acc(diff, exp_lut)
+        e = exp_q16_from_diff_acc(diff, exp_lut, coef_q24)
         exp_weights.append(e)
         sum_exp += e
 

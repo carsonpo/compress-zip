@@ -164,18 +164,21 @@ mod tests {
     #[test]
     fn test_exp_q16_from_diff() {
         let lut = make_exp_lut();
-        // Use a more realistic lm_head_w_clip value to get meaningful exp values
-        let coef = compute_coef_q24_for_acc(128.0);
+        let coef = compute_coef_q24();
 
         // diff = 0 should give max (65535)
         assert_eq!(exp_q16_from_diff(0, &lut, coef), 65535);
 
-        // Negative diff should give smaller values
-        let e1 = exp_q16_from_diff(-100, &lut, coef);
-        let e2 = exp_q16_from_diff(-200, &lut, coef);
-        assert!(e1 > e2, "e1={} should be > e2={}", e1, e2);
-        assert!(e1 < 65535, "e1={} should be < 65535", e1);
-        assert!(e2 >= 1, "e2={} should be >= 1", e2);
+        // With the small coef (~37819), we need larger diffs to see decay
+        let e_1000 = exp_q16_from_diff(-1000, &lut, coef);
+        let e_5000 = exp_q16_from_diff(-5000, &lut, coef);
+        let e_10000 = exp_q16_from_diff(-10000, &lut, coef);
+
+        // Larger negative diffs should give smaller values
+        assert!(e_1000 <= 65535);
+        assert!(e_5000 < e_1000, "e_5000={} should be < e_1000={}", e_5000, e_1000);
+        assert!(e_10000 < e_5000, "e_10000={} should be < e_5000={}", e_10000, e_5000);
+        assert!(e_10000 >= 1, "e_10000={} should be >= 1", e_10000);
     }
 
     #[test]

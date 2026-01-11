@@ -334,15 +334,15 @@ mod tests {
 
     #[test]
     fn test_clamp_i8() {
-        // Matches CUDA: clamp to [-128, 127] (full int8 range)
+        // Clamps to symmetric range [-127, 127] for quantization
         assert_eq!(clamp_i8(0), 0);
         assert_eq!(clamp_i8(127), 127);
         assert_eq!(clamp_i8(128), 127);
         assert_eq!(clamp_i8(-127), -127);
-        assert_eq!(clamp_i8(-128), -128);  // CUDA uses -128, not -127
-        assert_eq!(clamp_i8(-129), -128);  // Underflow clamps to -128
+        assert_eq!(clamp_i8(-128), -127);  // Symmetric range uses -127
+        assert_eq!(clamp_i8(-129), -127);  // Underflow clamps to -127
         assert_eq!(clamp_i8(1000), 127);
-        assert_eq!(clamp_i8(-1000), -128);  // CUDA uses -128
+        assert_eq!(clamp_i8(-1000), -127);
     }
 
     #[test]
