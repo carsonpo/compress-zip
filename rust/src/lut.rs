@@ -11,7 +11,9 @@ pub const EXP_FRAC_BITS: usize = 8;
 pub const EXP_FRAC_SIZE: usize = 1 << EXP_FRAC_BITS; // 256
 
 /// Constants for RoPE LUT
-pub const ROPE_MAX_SEQ_LEN: usize = 64;
+pub const ROPE_DEFAULT_MAX_SEQ_LEN: usize = 64;
+pub const ROPE_MAX_SEQ_LEN: usize = ROPE_DEFAULT_MAX_SEQ_LEN; // For backwards compatibility
+pub const ROPE_MAX_SUPPORTED_SEQ_LEN: usize = 4096;
 pub const ROPE_HALF_DIM: usize = 32;
 pub const ROPE_HEAD_DIM: usize = 64;
 
@@ -74,21 +76,39 @@ impl Exp2LutQ16 {
 /// Contains precomputed cos/sin values for each position and dimension.
 #[derive(Clone)]
 pub struct RopeLut {
-    /// cos values: [pos][dim] in Q1.15 format
-    pub cos_q15: [[i16; ROPE_HALF_DIM]; ROPE_MAX_SEQ_LEN],
-    /// sin values: [pos][dim] in Q1.15 format
-    pub sin_q15: [[i16; ROPE_HALF_DIM]; ROPE_MAX_SEQ_LEN],
+    /// cos values: [pos][dim] in Q1.15 format (flattened: pos * half_dim + dim)
+    pub cos_q15: Vec<i16>,
+    /// sin values: [pos][dim] in Q1.15 format (flattened: pos * half_dim + dim)
+    pub sin_q15: Vec<i16>,
+    /// Maximum sequence length
+    pub max_seq_len: usize,
+    /// Half of head dimension
+    pub half_dim: usize,
 }
 
 impl RopeLut {
-    /// Generate RoPE LUT for the given theta value.
+    /// Generate RoPE LUT for the given theta value with default sequence length.
     /// Matches Python: freq = 1 / (base ^ (2i / head_dim)), theta = pos * freq
     pub fn new(theta: f64) -> Self {
-        let mut cos_q15 = [[0i16; ROPE_HALF_DIM]; ROPE_MAX_SEQ_LEN];
-        let mut sin_q15 = [[0i16; ROPE_HALF_DIM]; ROPE_MAX_SEQ_LEN];
+        Self::with_max_seq_len(theta, ROPE_DEFAULT_MAX_SEQ_LEN)
+    }
 
-        for pos in 0..ROPE_MAX_SEQ_LEN {
-            for i in 0..ROPE_HALF_DIM {
+    /// Generate RoPE LUT for the given theta value and custom max sequence length.
+    pub fn with_max_seq_len(theta: f64, max_seq_len: usize) -> Self {
+        assert!(
+            max_seq_len <= ROPE_MAX_SUPPORTED_SEQ_LEN,
+            "max_seq_len {} exceeds maximum supported {}",
+            max_seq_len,
+            ROPE_MAX_SUPPORTED_SEQ_LEN
+        );
+
+        let half_dim = ROPE_HALF_DIM;
+        let size = max_seq_len * half_dim;
+        let mut cos_q15 = vec![0i16; size];
+        let mut sin_q15 = vec![0i16; size];
+
+        for pos in 0..max_seq_len {
+            for i in 0..half_dim {
                 // Python: freq = 1.0 / (base ^ (2*i / head_dim))
                 let freq = 1.0 / theta.powf((2 * i) as f64 / ROPE_HEAD_DIM as f64);
                 let angle = (pos as f64) * freq;
@@ -101,12 +121,18 @@ impl RopeLut {
                 let c_q15 = round_ties_to_even_host(c * 32768.0);
                 let s_q15 = round_ties_to_even_host(s * 32768.0);
 
-                cos_q15[pos][i] = c_q15.clamp(-32768, 32767) as i16;
-                sin_q15[pos][i] = s_q15.clamp(-32768, 32767) as i16;
+                let idx = pos * half_dim + i;
+                cos_q15[idx] = c_q15.clamp(-32768, 32767) as i16;
+                sin_q15[idx] = s_q15.clamp(-32768, 32767) as i16;
             }
         }
 
-        Self { cos_q15, sin_q15 }
+        Self {
+            cos_q15,
+            sin_q15,
+            max_seq_len,
+            half_dim,
+        }
     }
 
     /// Create from pre-computed arrays (loaded from model file).
@@ -115,35 +141,39 @@ impl RopeLut {
     ///
     /// cos_data and sin_data should be [max_seq_len * half_dim] in row-major order.
     pub fn from_arrays(cos_data: &[i16], sin_data: &[i16]) -> Result<Self, &'static str> {
-        let expected_len = ROPE_MAX_SEQ_LEN * ROPE_HALF_DIM;
+        Self::from_arrays_with_dims(cos_data, sin_data, ROPE_DEFAULT_MAX_SEQ_LEN, ROPE_HALF_DIM)
+    }
+
+    /// Create from pre-computed arrays with custom dimensions.
+    pub fn from_arrays_with_dims(
+        cos_data: &[i16],
+        sin_data: &[i16],
+        max_seq_len: usize,
+        half_dim: usize,
+    ) -> Result<Self, &'static str> {
+        let expected_len = max_seq_len * half_dim;
         if cos_data.len() != expected_len || sin_data.len() != expected_len {
-            return Err("RoPE LUT arrays must have exactly max_seq_len * half_dim entries");
+            return Err("RoPE LUT arrays size mismatch with max_seq_len * half_dim");
         }
 
-        let mut cos_q15 = [[0i16; ROPE_HALF_DIM]; ROPE_MAX_SEQ_LEN];
-        let mut sin_q15 = [[0i16; ROPE_HALF_DIM]; ROPE_MAX_SEQ_LEN];
-
-        for pos in 0..ROPE_MAX_SEQ_LEN {
-            for i in 0..ROPE_HALF_DIM {
-                let idx = pos * ROPE_HALF_DIM + i;
-                cos_q15[pos][i] = cos_data[idx];
-                sin_q15[pos][i] = sin_data[idx];
-            }
-        }
-
-        Ok(Self { cos_q15, sin_q15 })
+        Ok(Self {
+            cos_q15: cos_data.to_vec(),
+            sin_q15: sin_data.to_vec(),
+            max_seq_len,
+            half_dim,
+        })
     }
 
     /// Get cos value for given position and dimension.
     #[inline]
     pub fn cos(&self, pos: usize, dim: usize) -> i16 {
-        self.cos_q15[pos][dim]
+        self.cos_q15[pos * self.half_dim + dim]
     }
 
     /// Get sin value for given position and dimension.
     #[inline]
     pub fn sin(&self, pos: usize, dim: usize) -> i16 {
-        self.sin_q15[pos][dim]
+        self.sin_q15[pos * self.half_dim + dim]
     }
 }
 
@@ -254,5 +284,27 @@ mod tests {
                 assert!(lut.sin(pos, dim) >= -32768 && lut.sin(pos, dim) <= 32767);
             }
         }
+    }
+
+    #[test]
+    fn test_rope_lut_custom_length() {
+        // Test with 256 positions
+        let lut = RopeLut::with_max_seq_len(10000.0, 256);
+
+        assert_eq!(lut.max_seq_len, 256);
+        assert_eq!(lut.half_dim, ROPE_HALF_DIM);
+        assert_eq!(lut.cos_q15.len(), 256 * ROPE_HALF_DIM);
+        assert_eq!(lut.sin_q15.len(), 256 * ROPE_HALF_DIM);
+
+        // Position 0 should still have cos=1, sin=0
+        assert_eq!(lut.cos(0, 0), 32767);
+        assert_eq!(lut.sin(0, 0), 0);
+
+        // Test position beyond default length
+        let cos_200 = lut.cos(200, 0);
+        let sin_200 = lut.sin(200, 0);
+        // Just verify they're in valid range
+        assert!(cos_200 >= -32768 && cos_200 <= 32767);
+        assert!(sin_200 >= -32768 && sin_200 <= 32767);
     }
 }

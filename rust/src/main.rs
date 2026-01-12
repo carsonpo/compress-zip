@@ -4,7 +4,7 @@
 
 use clap::{Parser, Subcommand};
 use compress_zip::arith_coder::{ArithDecoder, ArithEncoder};
-use compress_zip::file_format::{CompressedFile, Codec, CZIPv1OuterHeader, TOKENS_PER_CHUNK};
+use compress_zip::file_format::{CompressedFile, Codec, CZIPv1OuterHeader};
 use compress_zip::model::{Model, ModelWeights};
 use compress_zip::tiktoken::{load_tiktoken_json_tokenizer, load_tiktoken_json_from_bytes};
 use md5::{Md5, Digest};
@@ -46,6 +46,12 @@ enum Commands {
         /// Compression codec (zstd or brotli)
         #[arg(short, long, default_value = "brotli")]
         codec: String,
+
+        /// Compression level 1-5 (context length: 1=64, 2=128, 3=256, 4=512, 5=1024 tokens).
+        /// Higher levels use more context for better compression but require more memory.
+        /// If not specified, uses the model's default context length.
+        #[arg(short = 'L', long, value_parser = clap::value_parser!(u8).range(1..=5))]
+        level: Option<u8>,
     },
     /// Decompress a compressed file
     Decompress {
@@ -102,12 +108,26 @@ fn decompress_tokenizer_data(data: &[u8], codec: &str) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Convert compression level (1-5) to context length
+/// Level 1=64, 2=128, 3=256, 4=512, 5=1024
+fn level_to_context_length(level: u8) -> usize {
+    match level {
+        1 => 64,
+        2 => 128,
+        3 => 256,
+        4 => 512,
+        5 => 1024,
+        _ => 64, // fallback
+    }
+}
+
 fn compress(
     model_path: PathBuf,
     tokenizer_path: Option<PathBuf>,
     input_path: PathBuf,
     output_path: PathBuf,
     codec_str: String,
+    level: Option<u8>,
 ) -> io::Result<()> {
     let total_start = Instant::now();
 
@@ -162,8 +182,24 @@ fn compress(
 
     let model_id_hash = hash_model_path(&model_path);
 
-    // Process in chunks of TOKENS_PER_CHUNK
-    let chunk_size = TOKENS_PER_CHUNK as usize;
+    // Determine context length: use --level if provided, otherwise model's default
+    let chunk_size = if let Some(lvl) = level {
+        let requested = level_to_context_length(lvl);
+        // Ensure it doesn't exceed model's RoPE LUT size
+        if requested > weights.config.context_length {
+            eprintln!(
+                "Warning: Level {} requires {} tokens but model only supports {}. Using model's context length.",
+                lvl, requested, weights.config.context_length
+            );
+            weights.config.context_length
+        } else {
+            requested
+        }
+    } else {
+        weights.config.context_length
+    };
+    let context_length_log2 = (chunk_size as f64).log2() as u8;
+    println!("Using context length: {} tokens (level {})", chunk_size, context_length_log2 - 5);
     let num_chunks = (num_tokens + chunk_size - 1) / chunk_size;
 
     // Process chunks in parallel
@@ -194,7 +230,7 @@ fn compress(
             let last_chunk_tokens = if is_last {
                 chunk_tokens.len() as u16
             } else {
-                TOKENS_PER_CHUNK
+                chunk_size as u16
             };
 
             (chunk_data, last_chunk_tokens)
@@ -202,11 +238,12 @@ fn compress(
         .collect();
 
     // Build CompressedFile from results (must be in order)
-    let mut cf = CompressedFile::new(
+    let mut cf = CompressedFile::with_context_length(
         model_id_hash,
         0, // tokenizer_id
         codec,
         input_bytes as u32,
+        context_length_log2,
     );
     for (chunk_idx, (chunk_data, last_chunk_tokens)) in chunk_results.into_iter().enumerate() {
         let is_last = chunk_idx == num_chunks - 1;
@@ -400,7 +437,8 @@ fn main() {
             input,
             output,
             codec,
-        } => compress(model, tokenizer, input, output, codec),
+            level,
+        } => compress(model, tokenizer, input, output, codec, level),
         Commands::Decompress {
             model,
             tokenizer,

@@ -51,6 +51,7 @@ class ModelConfig:
     head_dim: int = 64
     max_seq_len: int = 8192
     rope_theta_q16: int = 655360000  # 10000.0 * 65536
+    context_length: int = 64  # Tokens per chunk (from context_length_log2)
 
     @classmethod
     def from_metadata(cls, metadata: Dict[str, str]) -> "ModelConfig":
@@ -65,6 +66,12 @@ class ModelConfig:
                     return val
             return default
 
+        # Get context_length from either context_length or context_length_log2
+        context_length = get_val("context_length", None)
+        if context_length is None:
+            context_length_log2 = get_val("context_length_log2", 6)
+            context_length = 1 << context_length_log2
+
         return cls(
             vocab_size=get_val("vocab_size", 1024),
             n_layers=get_val("n_layers", 1),
@@ -75,6 +82,7 @@ class ModelConfig:
             head_dim=get_val("head_dim", 64),
             max_seq_len=get_val("max_seq_len", 8192),
             rope_theta_q16=get_val("rope_theta_q16", 655360000),
+            context_length=context_length,
         )
 
 

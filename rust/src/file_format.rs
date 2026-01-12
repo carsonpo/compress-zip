@@ -11,9 +11,9 @@
 //! Inner header (before compression):
 //! - model_id_hash: u32 LE
 //! - chunk_count: u32 LE
-//! - last_chunk_tokens: u16 LE (1..64)
+//! - last_chunk_tokens: u16 LE (1..tokens_per_chunk)
 //! - tokenizer_id: u8
-//! - reserved: u8
+//! - context_length_log2: u8 (power of 2 for tokens per chunk, default 6 = 64)
 //! - chunk_byte_lens: [u16; chunk_count] LE
 
 use std::io::{self, Read, Write};
@@ -24,8 +24,23 @@ pub const MAGIC: &[u8; 6] = b"CZIPv1";
 /// Outer header size in bytes
 pub const OUTER_HEADER_SIZE: usize = 16;
 
-/// Fixed tokens per chunk (except last chunk)
-pub const TOKENS_PER_CHUNK: u16 = 64;
+/// Default context length log2 (2^6 = 64 tokens per chunk)
+pub const DEFAULT_CONTEXT_LENGTH_LOG2: u8 = 6;
+
+/// Minimum context length log2 (2^6 = 64 tokens)
+pub const MIN_CONTEXT_LENGTH_LOG2: u8 = 6;
+
+/// Maximum context length log2 (2^12 = 4096 tokens)
+pub const MAX_CONTEXT_LENGTH_LOG2: u8 = 12;
+
+/// Fixed tokens per chunk (except last chunk) - for backwards compatibility
+pub const TOKENS_PER_CHUNK: u16 = 1 << DEFAULT_CONTEXT_LENGTH_LOG2;
+
+/// Convert context_length_log2 to actual tokens per chunk
+#[inline]
+pub fn context_length_from_log2(log2: u8) -> u16 {
+    1u16 << log2
+}
 
 /// Compression codec identifiers
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,19 +160,32 @@ pub struct CZIPv1InnerHeader {
     pub chunk_count: u32,
     pub last_chunk_tokens: u16,
     pub tokenizer_id: u8,
-    pub reserved: u8,
+    pub context_length_log2: u8,
     pub chunk_byte_lens: Vec<u16>,
+}
+
+impl CZIPv1InnerHeader {
+    /// Get the tokens per chunk based on context_length_log2
+    #[inline]
+    pub fn tokens_per_chunk(&self) -> u16 {
+        context_length_from_log2(self.context_length_log2)
+    }
 }
 
 impl CZIPv1InnerHeader {
     /// Create a new inner header.
     pub fn new(model_id_hash: u32, tokenizer_id: u8) -> Self {
+        Self::with_context_length(model_id_hash, tokenizer_id, DEFAULT_CONTEXT_LENGTH_LOG2)
+    }
+
+    /// Create a new inner header with custom context length.
+    pub fn with_context_length(model_id_hash: u32, tokenizer_id: u8, context_length_log2: u8) -> Self {
         Self {
             model_id_hash,
             chunk_count: 0,
-            last_chunk_tokens: TOKENS_PER_CHUNK,
+            last_chunk_tokens: context_length_from_log2(context_length_log2),
             tokenizer_id,
-            reserved: 0,
+            context_length_log2,
             chunk_byte_lens: Vec::new(),
         }
     }
@@ -180,7 +208,12 @@ impl CZIPv1InnerHeader {
         let chunk_count = u32::from_le_bytes(data[4..8].try_into().unwrap());
         let last_chunk_tokens = u16::from_le_bytes(data[8..10].try_into().unwrap());
         let tokenizer_id = data[10];
-        let reserved = data[11];
+        let mut context_length_log2 = data[11];
+
+        // Handle backwards compatibility: 0 means default (64 tokens)
+        if context_length_log2 == 0 {
+            context_length_log2 = DEFAULT_CONTEXT_LENGTH_LOG2;
+        }
 
         let expected_len = 12 + 2 * chunk_count as usize;
         if data.len() < expected_len {
@@ -203,7 +236,7 @@ impl CZIPv1InnerHeader {
             chunk_count,
             last_chunk_tokens,
             tokenizer_id,
-            reserved,
+            context_length_log2,
             chunk_byte_lens,
         })
     }
@@ -215,7 +248,7 @@ impl CZIPv1InnerHeader {
         buf.extend_from_slice(&self.chunk_count.to_le_bytes());
         buf.extend_from_slice(&self.last_chunk_tokens.to_le_bytes());
         buf.push(self.tokenizer_id);
-        buf.push(self.reserved);
+        buf.push(self.context_length_log2);
         for &byte_len in &self.chunk_byte_lens {
             buf.extend_from_slice(&byte_len.to_le_bytes());
         }
@@ -238,16 +271,37 @@ pub struct CompressedFile {
 }
 
 impl CompressedFile {
-    /// Create a new compressed file.
+    /// Create a new compressed file with default context length.
     pub fn new(
         model_id_hash: u32,
         tokenizer_id: u8,
         codec: Codec,
         uncompressed_text_len: u32,
     ) -> Self {
+        Self::with_context_length(
+            model_id_hash,
+            tokenizer_id,
+            codec,
+            uncompressed_text_len,
+            DEFAULT_CONTEXT_LENGTH_LOG2,
+        )
+    }
+
+    /// Create a new compressed file with custom context length.
+    pub fn with_context_length(
+        model_id_hash: u32,
+        tokenizer_id: u8,
+        codec: Codec,
+        uncompressed_text_len: u32,
+        context_length_log2: u8,
+    ) -> Self {
         Self {
             outer_header: CZIPv1OuterHeader::new(codec, uncompressed_text_len),
-            inner_header: CZIPv1InnerHeader::new(model_id_hash, tokenizer_id),
+            inner_header: CZIPv1InnerHeader::with_context_length(
+                model_id_hash,
+                tokenizer_id,
+                context_length_log2,
+            ),
             chunks: Vec::new(),
         }
     }
@@ -280,8 +334,9 @@ impl CompressedFile {
         if self.inner_header.chunk_count == 0 {
             return 0;
         }
+        let tokens_per_chunk = self.inner_header.tokens_per_chunk() as u32;
         let full_chunks = self.inner_header.chunk_count - 1;
-        full_chunks * TOKENS_PER_CHUNK as u32 + self.inner_header.last_chunk_tokens as u32
+        full_chunks * tokens_per_chunk + self.inner_header.last_chunk_tokens as u32
     }
 
     /// Get token count for a specific chunk.
@@ -289,7 +344,7 @@ impl CompressedFile {
         if chunk_idx == self.inner_header.chunk_count as usize - 1 {
             self.inner_header.last_chunk_tokens
         } else {
-            TOKENS_PER_CHUNK
+            self.inner_header.tokens_per_chunk()
         }
     }
 
@@ -443,5 +498,39 @@ mod tests {
         assert_eq!(parsed.get_chunk_tokens(0), 64);
         assert_eq!(parsed.get_chunk_tokens(1), 64);
         assert_eq!(parsed.get_chunk_tokens(2), 48);
+    }
+
+    #[test]
+    fn test_custom_context_length() {
+        // Test with 128 tokens per chunk (log2 = 7)
+        let mut file = CompressedFile::with_context_length(
+            0x12345678,
+            0,
+            Codec::Zstd,
+            4000,
+            7, // 2^7 = 128 tokens per chunk
+        );
+        file.add_chunk(vec![1, 2, 3], false, 128);
+        file.add_chunk(vec![4, 5], true, 100);
+
+        let (outer_bytes, payload) = file.to_bytes_uncompressed();
+
+        let outer = CZIPv1OuterHeader::from_bytes(&outer_bytes).unwrap();
+        let parsed = CompressedFile::read_from_decompressed(outer, &payload).unwrap();
+
+        assert_eq!(parsed.inner_header.context_length_log2, 7);
+        assert_eq!(parsed.inner_header.tokens_per_chunk(), 128);
+        assert_eq!(parsed.get_total_tokens(), 128 + 100);
+        assert_eq!(parsed.get_chunk_tokens(0), 128);
+        assert_eq!(parsed.get_chunk_tokens(1), 100);
+    }
+
+    #[test]
+    fn test_context_length_from_log2() {
+        assert_eq!(context_length_from_log2(6), 64);
+        assert_eq!(context_length_from_log2(7), 128);
+        assert_eq!(context_length_from_log2(8), 256);
+        assert_eq!(context_length_from_log2(10), 1024);
+        assert_eq!(context_length_from_log2(12), 4096);
     }
 }

@@ -4,7 +4,7 @@
 //! for arithmetic coding.
 //! Matches CUDA softmax_cumfreq.cu exactly (softmax_cumfreq_i32_u32_kernel).
 
-use crate::lut::{Exp2LutQ16, EXP_FRAC_SIZE};
+use crate::lut::Exp2LutQ16;
 use crate::primitives::{argmax_deterministic, round_ties_to_even_host};
 
 /// Arithmetic coder constants

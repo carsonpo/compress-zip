@@ -12,9 +12,9 @@ Outer envelope structure:
 Inner header structure:
 - u32: model_id_hash
 - u32: chunk_count
-- u16: last_chunk_tokens (1..64)
+- u16: last_chunk_tokens (1..tokens_per_chunk)
 - u8: tokenizer_id
-- u8: reserved
+- u8: context_length_log2 (power of 2 for tokens per chunk, default 6 = 64 tokens)
 - u16[chunk_count]: chunk_byte_len array
 - [chunk_data]: concatenated chunk payloads
 """
@@ -44,7 +44,23 @@ CZIP_MAGIC = b'CZIPv1'  # 6 bytes
 OUTER_HEADER_SIZE = 16  # Fixed outer header size
 
 # Chunk configuration
-TOKENS_PER_CHUNK = 64  # All chunks except last have exactly 64 tokens
+DEFAULT_CONTEXT_LENGTH_LOG2 = 6  # Default: 2^6 = 64 tokens per chunk
+TOKENS_PER_CHUNK = 1 << DEFAULT_CONTEXT_LENGTH_LOG2  # For backwards compatibility
+MIN_CONTEXT_LENGTH_LOG2 = 6   # Minimum: 64 tokens
+MAX_CONTEXT_LENGTH_LOG2 = 12  # Maximum: 4096 tokens
+
+
+def context_length_from_log2(log2: int) -> int:
+    """Convert context_length_log2 to actual tokens per chunk."""
+    return 1 << log2
+
+
+def context_length_to_log2(tokens: int) -> int:
+    """Convert tokens per chunk to log2 (must be power of 2)."""
+    import math
+    if tokens <= 0 or (tokens & (tokens - 1)) != 0:
+        raise ValueError(f"tokens must be a power of 2, got {tokens}")
+    return int(math.log2(tokens))
 
 
 class Codec(IntEnum):
@@ -129,17 +145,22 @@ class CZIPv1InnerHeader:
     Layout:
     - model_id_hash: 4 bytes (u32 LE, for mismatch detection, 0 if unused)
     - chunk_count: 4 bytes (u32 LE)
-    - last_chunk_tokens: 2 bytes (u16 LE, 1..64)
+    - last_chunk_tokens: 2 bytes (u16 LE, 1..tokens_per_chunk)
     - tokenizer_id: 1 byte (u8, 0 for default)
-    - reserved: 1 byte (u8)
+    - context_length_log2: 1 byte (u8, power of 2 for tokens per chunk, default 6 = 64)
     - chunk_byte_lens: chunk_count * 2 bytes (u16 LE each)
     """
     model_id_hash: int = 0
     chunk_count: int = 0
     last_chunk_tokens: int = TOKENS_PER_CHUNK
     tokenizer_id: int = 0
-    reserved: int = 0
+    context_length_log2: int = DEFAULT_CONTEXT_LENGTH_LOG2
     chunk_byte_lens: List[int] = field(default_factory=list)
+
+    @property
+    def tokens_per_chunk(self) -> int:
+        """Get the actual tokens per chunk from context_length_log2."""
+        return context_length_from_log2(self.context_length_log2)
 
     def header_size(self) -> int:
         """Get inner header size in bytes (excluding chunk data)."""
@@ -153,7 +174,7 @@ class CZIPv1InnerHeader:
             self.chunk_count,
             self.last_chunk_tokens,
             self.tokenizer_id,
-            self.reserved,
+            self.context_length_log2,
         )
         # Append chunk byte lengths
         for byte_len in self.chunk_byte_lens:
@@ -166,10 +187,14 @@ class CZIPv1InnerHeader:
         if len(data) < 12:
             raise ValueError(f"Inner header too short: {len(data)} < 12")
 
-        model_id_hash, chunk_count, last_chunk_tokens, tokenizer_id, reserved = struct.unpack(
+        model_id_hash, chunk_count, last_chunk_tokens, tokenizer_id, context_length_log2 = struct.unpack(
             '<IIHBB',
             data[:12]
         )
+
+        # Handle backwards compatibility: 0 means default (64 tokens)
+        if context_length_log2 == 0:
+            context_length_log2 = DEFAULT_CONTEXT_LENGTH_LOG2
 
         expected_len = 12 + 2 * chunk_count
         if len(data) < expected_len:
@@ -187,7 +212,7 @@ class CZIPv1InnerHeader:
             chunk_count=chunk_count,
             last_chunk_tokens=last_chunk_tokens,
             tokenizer_id=tokenizer_id,
-            reserved=reserved,
+            context_length_log2=context_length_log2,
             chunk_byte_lens=chunk_byte_lens,
         )
 
@@ -244,23 +269,38 @@ class CompressedFile:
         tokenizer_id: int = 0,
         codec: Codec = Codec.ZSTD,
         is_multifile: bool = False,
+        context_length_log2: int = DEFAULT_CONTEXT_LENGTH_LOG2,
     ) -> "CompressedFile":
-        """Create a new compressed file."""
+        """Create a new compressed file.
+
+        Args:
+            model_id_hash: Model identification hash
+            tokenizer_id: Tokenizer identifier
+            codec: Compression codec (ZSTD or BROTLI)
+            is_multifile: Whether this is a multifile archive
+            context_length_log2: Power of 2 for tokens per chunk (6=64, 7=128, etc.)
+        """
+        if not (MIN_CONTEXT_LENGTH_LOG2 <= context_length_log2 <= MAX_CONTEXT_LENGTH_LOG2):
+            raise ValueError(
+                f"context_length_log2 must be between {MIN_CONTEXT_LENGTH_LOG2} and "
+                f"{MAX_CONTEXT_LENGTH_LOG2}, got {context_length_log2}"
+            )
         cf = cls()
         cf.outer_header.codec_id = codec
         cf.outer_header.set_multifile(is_multifile)
         cf.inner_header.model_id_hash = model_id_hash
         cf.inner_header.tokenizer_id = tokenizer_id
+        cf.inner_header.context_length_log2 = context_length_log2
         return cf
 
-    def add_chunk(self, compressed_data: bytes, is_last: bool = False, last_chunk_tokens: int = TOKENS_PER_CHUNK):
+    def add_chunk(self, compressed_data: bytes, is_last: bool = False, last_chunk_tokens: int | None = None):
         """
         Add a compressed chunk.
 
         Args:
             compressed_data: Arithmetic-coded bytes for this chunk
             is_last: Whether this is the last chunk
-            last_chunk_tokens: Number of tokens in last chunk (1..64)
+            last_chunk_tokens: Number of tokens in last chunk (1..tokens_per_chunk)
         """
         if len(compressed_data) > 65535:
             raise ValueError(f"Chunk too large: {len(compressed_data)} > 65535 bytes")
@@ -270,6 +310,8 @@ class CompressedFile:
         self.inner_header.chunk_count = len(self.chunks)
 
         if is_last:
+            if last_chunk_tokens is None:
+                last_chunk_tokens = self.inner_header.tokens_per_chunk
             self.inner_header.last_chunk_tokens = last_chunk_tokens
 
     def finalize(self, uncompressed_text_len: int, compression_level: Optional[int] = None):
@@ -360,9 +402,10 @@ class CompressedFile:
         """Get total number of tokens across all chunks."""
         if self.inner_header.chunk_count == 0:
             return 0
-        # All chunks except last have TOKENS_PER_CHUNK tokens
+        # All chunks except last have tokens_per_chunk tokens
+        tokens_per_chunk = self.inner_header.tokens_per_chunk
         full_chunks = self.inner_header.chunk_count - 1
-        return full_chunks * TOKENS_PER_CHUNK + self.inner_header.last_chunk_tokens
+        return full_chunks * tokens_per_chunk + self.inner_header.last_chunk_tokens
 
     def get_chunk_tokens(self, chunk_idx: int) -> int:
         """Get number of tokens in a specific chunk."""
@@ -370,7 +413,7 @@ class CompressedFile:
             raise IndexError(f"Chunk index {chunk_idx} out of range")
         if chunk_idx == self.inner_header.chunk_count - 1:
             return self.inner_header.last_chunk_tokens
-        return TOKENS_PER_CHUNK
+        return self.inner_header.tokens_per_chunk
 
     def get_compressed_size(self) -> int:
         """Get total compressed size in bytes (outer header + compressed payload)."""

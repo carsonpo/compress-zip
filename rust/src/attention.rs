@@ -2,8 +2,7 @@
 //!
 //! Matches the CUDA implementation in attention.cu.
 
-use crate::linear::linear_i8_to_i32;
-use crate::lut::{exp_q16_from_neg_fixed_with_coef, Exp2LutQ16, RopeLut, ROPE_HALF_DIM, ROPE_HEAD_DIM};
+use crate::lut::{exp_q16_from_neg_fixed_with_coef, Exp2LutQ16, RopeLut, ROPE_HALF_DIM};
 use crate::primitives::{clamp_i8, div_rne_tte_s64_to_s32, sra_rne_tte_s32, sra_rne_tte_s64_to_s32};
 
 /// Constants for attention

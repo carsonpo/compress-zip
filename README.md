@@ -2,6 +2,8 @@
 
 CPU reference implementations (Rust and Python) for the [compress.zip](https://compress.zip) neural compression API.
 
+![Compression Comparison](assets/compression_chart.png)
+
 ## What is this?
 
 This repo lets you independently verify compression ratios and determinism of data compressed through the compress.zip API. Both implementations produce bit-exact identical output, so you can validate that your compressed files decompress correctly without relying on our servers.
@@ -12,21 +14,25 @@ The compress.zip service lets you upload a text corpus, trains a bespoke tokeniz
 
 ## Compression Performance
 
-Wikipedia articles (~15KB each):
+Wikipedia articles (~15KB each), compressed size in bytes:
 
-| Article | Original | CZIP | brotli-11 | zstd-22 | gzip-9 |
-|---------|----------|------|-----------|---------|--------|
-| Machine Learning | 15,003 | **3,876 (3.87x)** | 4,303 (3.49x) | 5,541 (2.71x) | 5,783 (2.59x) |
-| World War II | 15,024 | **4,316 (3.48x)** | 4,729 (3.18x) | 5,914 (2.54x) | 6,139 (2.45x) |
-| Python (PL) | 15,020 | **4,336 (3.46x)** | 4,670 (3.22x) | 5,852 (2.57x) | 6,079 (2.47x) |
-| Einstein | 15,038 | **4,392 (3.42x)** | 4,920 (3.06x) | 6,306 (2.38x) | 6,546 (2.30x) |
-| Rust (PL) | 15,014 | **4,447 (3.38x)** | 4,727 (3.18x) | 6,001 (2.50x) | 6,217 (2.41x) |
+| Article | Original | CZIP L1 | CZIP L5 | brotli-11 | zstd-22 | gzip-9 |
+|---------|----------|---------|-----------|-----------|---------|--------|
+| Machine Learning | 15,003 | 3,956 | **3,552** | 4,303 | 5,541 | 5,783 |
+| World War II | 15,024 | 4,397 | **3,944** | 4,729 | 5,914 | 6,139 |
+| Python (PL) | 15,020 | 4,427 | **4,043** | 4,670 | 5,852 | 6,079 |
+| Einstein | 15,038 | 4,511 | **4,070** | 4,920 | 6,306 | 6,546 |
+| Rust (PL) | 15,014 | 4,585 | **4,188** | 4,727 | 6,001 | 6,217 |
+| **Total** | 75,099 | 21,876 | **19,797** | 23,349 | 29,614 | 30,764 |
+
+Compression improves monotonically with context length. L5 (1024 tokens) achieves **3.6-4.2x** compression ratio—15-20% better than brotli-11. The same model works at all levels.
+
 
 ### Comparison with Other Neural Compressors
 
 | Compressor | Model | Compression | Speed | Hardware |
 |------------|-------|-------------|-------|----------|
-| **CZIP** | tiny GPT model | 3.4-3.9x | ~350k tok/s | CPU (Mac Studio) |
+| **CZIP** | tiny GPT model | 3.6-4.2x | ~350k tok/s | CPU (Mac Studio) |
 | [ts_zip](https://bellard.org/ts_zip/) | RWKV 169M | ~7x | ~577 tok/s | RTX 4090 GPU |
 | [llama-zip](https://github.com/alexbuz/llama-zip) | Llama 3.1 8B | 8-29x | ~30 tok/s | GPU |
 
@@ -44,6 +50,7 @@ This means you get bit-exact results on any hardware: x86, ARM, a microcontrolle
 - **Softmax**: exp2 LUT (Q16 output)
 - **RoPE**: Q1.15 sin/cos tables
 - **Arithmetic coder**: 32-bit state, E1/E2/E3 renormalization
+- **Context length**: Configurable 64-4096 tokens (stored as power-of-2 in file header)
 
 ## Installation
 
@@ -67,20 +74,20 @@ pip install -e ".[dev]"
 
 ```bash
 # Rust
-./target/release/compress_zip compress -m models/v000_eng.czm -i input.txt -o output.czip
+./target/release/compress_zip compress -m models/v001_eng.czm -i input.txt -o output.czip
 
 # Python
-python -m compress_zip compress -m models/v000_eng.czm -i input.txt -o output.czip
+python -m compress_zip compress -m models/v001_eng.czm -i input.txt -o output.czip
 ```
 
 ### Decompress
 
 ```bash
 # Rust
-./target/release/compress_zip decompress -m models/v000_eng.czm -i output.czip -o recovered.txt
+./target/release/compress_zip decompress -m models/v001_eng.czm -i output.czip -o recovered.txt
 
 # Python
-python -m compress_zip decompress -m models/v000_eng.czm -i output.czip -o recovered.txt
+python -m compress_zip decompress -m models/v001_eng.czm -i output.czip -o recovered.txt
 ```
 
 ### Options
@@ -88,6 +95,7 @@ python -m compress_zip decompress -m models/v000_eng.czm -i output.czip -o recov
 - `-m, --model` — Path to model file (safetensors format)
 - `-t, --tokenizer` — Tokenizer path (default: uses tokenizer embedded in model)
 - `-c, --codec` — Outer compression: `brotli` (default) or `zstd`
+- `-L, --level` — Compression level 1-5 (context: 1=64, 2=128, 3=256, 4=512, 5=1024 tokens)
 
 ## Running Tests
 

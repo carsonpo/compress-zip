@@ -7,7 +7,7 @@
 use crate::attention::{gqa_attention_mqa_i8, KVCache, HEAD_DIM, MAX_SEQ_LEN};
 use crate::linear::linear_i8_to_i32;
 use crate::lut::{Exp2LutQ16, RopeLut};
-use crate::primitives::{clamp_i8, sra_rne_tte_s32};
+use crate::primitives::clamp_i8;
 use crate::reglu::reglu_i8;
 use crate::rmsnorm::{rmsnorm_i8_to_i8, compute_eps_scaled};
 use crate::safetensors::{load_safetensors_with_metadata, Tensor};
@@ -26,6 +26,7 @@ pub struct ModelConfig {
     pub d_ff: usize,
     pub head_dim: usize,
     pub max_seq_len: usize,
+    pub context_length: usize,  // Tokens per chunk (RoPE LUT size)
     pub rope_theta_q16: u32,
 }
 
@@ -40,6 +41,7 @@ impl Default for ModelConfig {
             d_ff: 1024,
             head_dim: HEAD_DIM,
             max_seq_len: MAX_SEQ_LEN,
+            context_length: MAX_SEQ_LEN,
             rope_theta_q16: 655360000, // 10000.0 * 65536
         }
     }
@@ -118,6 +120,16 @@ impl ModelWeights {
                 .unwrap_or(default)
         };
 
+        // Parse context_length (tokens per chunk / RoPE LUT size)
+        // Prefer context_length, fall back to context_length_log2, then max_seq_len
+        let context_length = if let Some(cl) = metadata.get("context_length").and_then(|v| v.parse::<usize>().ok()) {
+            cl
+        } else if let Some(cl_log2) = metadata.get("context_length_log2").and_then(|v| v.parse::<usize>().ok()) {
+            1usize << cl_log2
+        } else {
+            parse_usize("max_seq_len", MAX_SEQ_LEN)
+        };
+
         let mut config = ModelConfig {
             vocab_size: parse_usize("vocab_size", 1024),
             n_layers: parse_usize("n_layers", 1),
@@ -127,6 +139,7 @@ impl ModelWeights {
             d_ff: parse_usize("d_ff", 1024),
             head_dim: parse_usize("head_dim", HEAD_DIM),
             max_seq_len: parse_usize("max_seq_len", MAX_SEQ_LEN),
+            context_length,
             rope_theta_q16: parse_u32("rope_theta_q16", 655360000),
         };
 
@@ -304,8 +317,14 @@ impl Model {
         // Load LUTs from embedded data in weights (for bit-exactness)
         let exp_lut = Exp2LutQ16::from_array(&weights.exp2_lut)
             .expect("Invalid exp2 LUT in model weights");
-        let rope_lut = RopeLut::from_arrays(&weights.rope_cos_lut, &weights.rope_sin_lut)
-            .expect("Invalid RoPE LUT in model weights");
+        // Use context_length from config for RoPE LUT (tokens per chunk)
+        let half_dim = config.head_dim / 2;
+        let rope_lut = RopeLut::from_arrays_with_dims(
+            &weights.rope_cos_lut,
+            &weights.rope_sin_lut,
+            config.context_length,
+            half_dim,
+        ).expect("Invalid RoPE LUT in model weights");
 
         // Use embedded constants for bit-exactness, fall back to computed if not present
         let coef_q24 = weights.coef_q24.unwrap_or_else(|| compute_coef_q24_for_acc(128.0));

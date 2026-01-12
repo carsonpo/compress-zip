@@ -15,10 +15,13 @@ EXP_Q16_SCALE = 1 << 16  # Q16 format
 
 ROPE_HEAD_DIM = 64
 ROPE_HALF_DIM = ROPE_HEAD_DIM // 2
-ROPE_DEFAULT_MAX_SEQ_LEN = 64  # Matches TOKENS_PER_CHUNK for chunked processing
+ROPE_DEFAULT_MAX_SEQ_LEN = 64  # Matches default TOKENS_PER_CHUNK for chunked processing
 ROPE_MAX_SEQ_LEN = ROPE_DEFAULT_MAX_SEQ_LEN  # Alias for backwards compatibility
 ROPE_Q15_SCALE = 1 << 15  # Q1.15 format
 ROPE_BASE = 10000.0
+
+# Maximum supported sequence length (2^12 = 4096)
+ROPE_MAX_SUPPORTED_SEQ_LEN = 4096
 
 
 class Exp2LutQ16:
@@ -139,7 +142,7 @@ def exp_q16_from_neg_fixed(neg_x_q8: int, exp_lut: Exp2LutQ16) -> int:
 
 # Pre-generated singleton instances
 _exp2_lut: Exp2LutQ16 | None = None
-_rope_lut: RopeLut | None = None
+_rope_lut_cache: dict[tuple[int, int, float], RopeLut] = {}
 
 
 def get_exp2_lut() -> Exp2LutQ16:
@@ -150,12 +153,30 @@ def get_exp2_lut() -> Exp2LutQ16:
     return _exp2_lut
 
 
-def get_rope_lut() -> RopeLut:
-    """Get the singleton RoPE LUT instance."""
-    global _rope_lut
-    if _rope_lut is None:
-        _rope_lut = RopeLut()
-    return _rope_lut
+def get_rope_lut(
+    max_seq_len: int = ROPE_DEFAULT_MAX_SEQ_LEN,
+    head_dim: int = ROPE_HEAD_DIM,
+    base: float = ROPE_BASE,
+) -> RopeLut:
+    """Get a cached RoPE LUT instance with specified parameters.
+
+    Args:
+        max_seq_len: Maximum sequence length (default 64, max 4096)
+        head_dim: Head dimension (default 64)
+        base: RoPE base frequency (default 10000.0)
+
+    Returns:
+        RopeLut instance with the specified parameters
+    """
+    if max_seq_len > ROPE_MAX_SUPPORTED_SEQ_LEN:
+        raise ValueError(
+            f"max_seq_len {max_seq_len} exceeds maximum supported {ROPE_MAX_SUPPORTED_SEQ_LEN}"
+        )
+
+    key = (max_seq_len, head_dim, base)
+    if key not in _rope_lut_cache:
+        _rope_lut_cache[key] = RopeLut(max_seq_len=max_seq_len, head_dim=head_dim, base=base)
+    return _rope_lut_cache[key]
 
 
 # Test cases
