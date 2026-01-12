@@ -62,6 +62,7 @@ pub struct LayerWeights {
     pub out_shift: i8,
     pub score_mult: Vec<i32>,       // [n_heads] Q0.15 (stored as i32 since values can be > 32768)
     pub score_shift: i8,
+    pub sink_key: Option<Vec<i8>>,  // [head_dim] int8 attention sink key (optional)
 
     // Post-attention norm / Pre-FFN norm (Q0.7 int8)
     pub post_attn_norm: Vec<i8>,    // [d_model]
@@ -200,6 +201,10 @@ impl ModelWeights {
         for i in 0..config.n_layers {
             let prefix = format!("layers.{}", i);
 
+            // Load optional sink key
+            let sink_key_name = format!("{}.attn.sink_key", prefix);
+            let sink_key = tensors.get(&sink_key_name).map(|t| to_i8_vec(t));
+
             let layer = LayerWeights {
                 // Norms (int8 Q0.7 - matches CUDA)
                 attn_norm: to_i8_vec(get_tensor(&format!("{}.attn_norm.weight", prefix))?),
@@ -216,6 +221,7 @@ impl ModelWeights {
                 out_shift: get_scalar_i8(&format!("{}.attn.out.shift", prefix), 0),
                 score_mult: to_i32_vec(get_tensor(&format!("{}.attn.score_mult", prefix))?),
                 score_shift: get_scalar_i8(&format!("{}.attn.score_shift", prefix), 15),
+                sink_key,
 
                 // FFN
                 up_weight: to_i8_vec(get_tensor(&format!("{}.ffn.up.weight", prefix))?),
@@ -411,6 +417,7 @@ impl Model {
                 &score_mul_q15,
                 &self.rope_lut,
                 &self.exp_lut,
+                layer.sink_key.as_deref(),
             );
 
             // Output projection

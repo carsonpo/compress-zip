@@ -92,11 +92,11 @@ pub fn compute_eps_scaled(eps: f64) -> i32 {
 pub fn rmsnorm_i8_int(x: &[i8], weight: &[i16], d: usize) -> Vec<i8> {
     let eps_sq = 1i32;
 
-    // Compute sum of squares
-    let sum_sq: i64 = x.iter().map(|&v| (v as i64) * (v as i64)).sum();
+    // Compute sum of squares (max = 127^2 * 64 = 1,032,256 fits in i32)
+    let sum_sq: i32 = x.iter().map(|&v| (v as i32) * (v as i32)).sum();
 
     // Mean of squares (add eps_sq for numerical stability)
-    let mean_sq = ((sum_sq + (d as i64 / 2)) / d as i64) as i32 + eps_sq;
+    let mean_sq = (sum_sq + (d as i32 / 2)) / d as i32 + eps_sq;
     let mean_sq = mean_sq.max(1);
 
     // Compute inverse RMS in Q15

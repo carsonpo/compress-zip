@@ -314,6 +314,7 @@ def gqa_attention_mqa_i8_cached(
     rope_cos: np.ndarray = None,
     rope_sin: np.ndarray = None,
     score_mul_q15: int = 32768,
+    sink_key: np.ndarray = None,
 ) -> np.ndarray:
     """
     Multi-Query Attention with pre-cached K/V.
@@ -328,6 +329,7 @@ def gqa_attention_mqa_i8_cached(
         rope_cos: Optional [max_seq_len, half_dim] int16 RoPE cos LUT
         rope_sin: Optional [max_seq_len, half_dim] int16 RoPE sin LUT
         score_mul_q15: Score multiplier in Q0.15 format
+        sink_key: Optional [head_dim] int8 attention sink key (value is zero)
 
     Returns:
         Output vector [head_dim] as int8
@@ -356,10 +358,26 @@ def gqa_attention_mqa_i8_cached(
     # For 64-bit values, process element-wise to ensure correct rounding
     scores = np.array([sra_rne_tte_s64_to_s32(int(p), 15) for p in prods])
 
+    # Compute sink score if sink key is provided
+    sink_score = None
+    if sink_key is not None:
+        # Dot product with RoPE'd Q (no RoPE on sink key)
+        sink_dot = int(np.sum(q_rot.astype(np.int64) * sink_key.astype(np.int64)))
+        sink_dot_unshift = sra_rne_tte_s32_np(np.array([sink_dot]), Q_SHIFT)[0]
+        sink_prod = int(sink_dot_unshift) * score_mul_q15
+        sink_score = sra_rne_tte_s64_to_s32(sink_prod, 15)
+
     # Online softmax (matching CUDA)
     m = -(1 << 30)
     s = 0
     vacc = np.zeros(HEAD_DIM, dtype=np.int64)
+
+    # Include sink score in initial max if present
+    if sink_score is not None:
+        m = sink_score
+        w_sink = exp_q16_from_attn_diff(0, exp_lut)  # diff = 0 since score == m
+        s = w_sink
+        # Note: sink value is zero, so no contribution to vacc
 
     for t in range(seq_len):
         score = int(scores[t])

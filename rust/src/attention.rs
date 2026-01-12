@@ -3,7 +3,7 @@
 //! Matches the CUDA implementation in attention.cu.
 
 use crate::lut::{exp_q16_from_neg_fixed_with_coef, Exp2LutQ16, RopeLut, ROPE_HALF_DIM};
-use crate::primitives::{clamp_i8, div_rne_tte_s64_to_s32, sra_rne_tte_s32, sra_rne_tte_s64_to_s32};
+use crate::primitives::{clamp_i8, div_rne_tte_s32_by_u64, sra_rne_tte_s32, sra_rne_tte_s64_to_s32};
 
 /// Constants for attention
 pub const HEAD_DIM: usize = 64;
@@ -156,6 +156,7 @@ impl KVCache {
 /// - score_mul_q15: [n_heads] scaling factors in Q0.15
 /// - rope_lut: precomputed RoPE LUT
 /// - exp_lut: precomputed exp2 LUT
+/// - sink_key: optional [head_dim] int8 attention sink key (value is zero)
 ///
 /// Output: [B, D] int8 Q0.7
 pub fn gqa_attention_mqa_i8(
@@ -166,6 +167,7 @@ pub fn gqa_attention_mqa_i8(
     score_mul_q15: &[i32],
     rope_lut: &RopeLut,
     exp_lut: &Exp2LutQ16,
+    sink_key: Option<&[i8]>,
 ) -> Vec<i8> {
     assert!(n_heads == 4 || n_heads == 6 || n_heads == 8);
     let d = n_heads * HEAD_DIM;
@@ -202,7 +204,24 @@ pub fn gqa_attention_mqa_i8(
             // Online softmax state
             let mut m: i32 = i32::MIN; // running max score
             let mut s: u64 = 0; // running sum of exp weights
-            let mut vacc = [0i64; HEAD_DIM]; // weighted V accumulator
+            // Weighted V accumulator (i32 sufficient: max = 64*65535*127 ≈ 532M < 2^30)
+            let mut vacc = [0i32; HEAD_DIM];
+
+            // Include sink score if sink key is provided
+            if let Some(sink_k) = sink_key {
+                // Compute dot product with sink key (no RoPE on sink key)
+                let sink_dot = qk_dot_i8(&q_rot, sink_k);
+                let sink_dot_unshift = sra_rne_tte_s32(sink_dot, Q_SHIFT);
+                let mul = score_mul_q15[h];
+                let sink_prod = (sink_dot_unshift as i64) * (mul as i64);
+                let sink_score = sra_rne_tte_s64_to_s32(sink_prod, 15);
+
+                // Initialize with sink score as max
+                m = sink_score;
+                let w_sink = exp_q16_from_neg_fixed_with_coef(0, exp_lut, ATTN_COEF_Q24);
+                s = w_sink as u64;
+                // Note: sink value is zero, so no contribution to vacc
+            }
 
             // Compute attention over all tokens
             for t in 0..tokens {
@@ -229,15 +248,16 @@ pub fn gqa_attention_mqa_i8(
                         s = (s * scale_old as u64 + 0x8000) >> 16;
                         // Rescale vacc - must match CUDA exactly
                         // CUDA: prod += (prod >= 0) ? (1LL << 15) : -(1LL << 15); vacc = prod >> 16;
+                        // Temporary i64 promotion needed for multiply, result fits in i32
                         for v in vacc.iter_mut() {
-                            let prod = (*v) * (scale_old as i64);
+                            let prod = (*v as i64) * (scale_old as i64);
                             // Match CUDA's rounding: add/subtract half then arithmetic shift
                             let adjusted = if prod >= 0 {
                                 prod + (1i64 << 15)
                             } else {
                                 prod - (1i64 << 15)
                             };
-                            *v = adjusted >> 16;
+                            *v = (adjusted >> 16) as i32;
                         }
                     }
                     m = score;
@@ -248,10 +268,10 @@ pub fn gqa_attention_mqa_i8(
                 let w = exp_q16_from_neg_fixed_with_coef(diff, exp_lut, ATTN_COEF_Q24);
                 s += w as u64;
 
-                // Accumulate weighted V
+                // Accumulate weighted V (i32 arithmetic: w*v fits in i32)
                 let v = kv_cache.get_v(batch, t);
                 for i in 0..HEAD_DIM {
-                    vacc[i] += (w as i64) * (v[i] as i64);
+                    vacc[i] += (w as i32) * (v[i] as i32);
                 }
             }
 
@@ -259,7 +279,7 @@ pub fn gqa_attention_mqa_i8(
             let denom = if s == 0 { 1 } else { s };
             let out_start = batch * d + h * HEAD_DIM;
             for i in 0..HEAD_DIM {
-                let y = div_rne_tte_s64_to_s32(vacc[i], denom);
+                let y = div_rne_tte_s32_by_u64(vacc[i], denom);
                 out[out_start + i] = clamp_i8(y);
             }
         }

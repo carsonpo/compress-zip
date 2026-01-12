@@ -12,6 +12,30 @@ The compress.zip service lets you upload a text corpus, trains a bespoke tokeniz
 
 **Note:** The compress.zip service is currently in development. If you are interested in many orders of magnitude faster performance than this repo, feel free to email me at carson at poole.ai
 
+## Custom Corpus Training
+
+The real power is training on your specific data. A bespoke tokenizer learns your corpus's vocabulary, dramatically improving bytes-per-token efficiency. Combined with a model trained on your exact distribution, compression ratios far exceed what's possible with generic models.
+
+**Example: Japanese + HTML corpus**
+
+A corpus mixing Japanese text with HTML markup gets terrible efficiency from a standard English tokenizer—just 1.33 bytes per token. After training a custom 1024-token vocabulary on this corpus: 2.84 bytes per token.
+
+Training the tokenizer and model took 5 minutes total on a single GPU.
+
+![Custom Corpus Compression](assets/custom_corpus_chart.png)
+
+32KB validation set, compressed size in bytes:
+
+| Level | Context | Custom Model | brotli-11 | zstd-19 | gzip-9 |
+|-------|---------|--------------|-----------|---------|--------|
+| L1 | 64 | 3,245 | 7,103 | 8,416 | 8,699 |
+| L2 | 128 | 2,578 | 7,103 | 8,416 | 8,699 |
+| L3 | 256 | 2,197 | 7,103 | 8,416 | 8,699 |
+| **L4** | **512** | **2,039** | 7,103 | 8,416 | 8,699 |
+| L5 | 1024 | 2,096 | 7,103 | 8,416 | 8,699 |
+
+L4 achieves **16x compression**—3.5x better than brotli-11 on this corpus.
+
 ## Compression Performance
 
 Wikipedia articles (~15KB each), compressed size in bytes:

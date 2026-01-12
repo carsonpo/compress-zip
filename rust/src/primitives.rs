@@ -154,6 +154,36 @@ pub fn div_rne_tte_s64_to_s32(num: i64, denom: u64) -> i32 {
     out.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
+/// Signed 32-bit divided by unsigned 64-bit with ties-to-even rounding.
+///
+/// Returns `round(num / denom)` as i32.
+/// Optimized version for attention output normalization where numerator fits in i32.
+/// This allows the compiler to use faster 32-bit operations where possible.
+#[inline]
+pub fn div_rne_tte_s32_by_u64(num: i32, denom: u64) -> i32 {
+    if denom == 0 {
+        return 0;
+    }
+
+    let sign: i32 = if num < 0 { -1 } else { 1 };
+    let abs_num = num.unsigned_abs() as u64;
+
+    let q = abs_num / denom;
+    let r = abs_num - q * denom;
+
+    let twice_r = r << 1;
+    let rounded_q = if twice_r > denom {
+        q + 1
+    } else if twice_r == denom {
+        q + (q & 1)
+    } else {
+        q
+    };
+
+    // Restore sign (result always fits in i32 since num was i32 and we divided)
+    (rounded_q as i32) * sign
+}
+
 /// Integer square root using the restoring algorithm.
 ///
 /// Returns `floor(sqrt(x))`. This is a pure integer operation with no

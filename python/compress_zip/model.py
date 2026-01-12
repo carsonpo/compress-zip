@@ -101,6 +101,7 @@ class LayerWeights:
     out_shift: np.int8          # scalar
     score_mult: np.ndarray      # [n_heads] int32 (Q0.15 stored as i32)
     score_shift: np.int8        # scalar
+    sink_key: Optional[np.ndarray] = None  # [head_dim] int8 attention sink key (optional)
 
     # Post-attention norm (Q0.7 int8)
     post_attn_norm: np.ndarray  # [d_model] int8
@@ -198,6 +199,12 @@ class ModelWeights:
             # Load layers
             layers = []
             for i in range(config.n_layers):
+                # Load optional sink key
+                sink_key_name = f"layers.{i}.attn.sink_key"
+                sink_key = None
+                if sink_key_name in f.keys():
+                    sink_key = ensure_i8(f.get_tensor(sink_key_name))
+
                 layer = LayerWeights(
                     # Norms (int8 Q0.7 - matches Rust)
                     attn_norm=ensure_i8(get_tensor(f"layers.{i}.attn_norm.weight")),
@@ -214,6 +221,7 @@ class ModelWeights:
                     out_shift=get_scalar_i8(f"layers.{i}.attn.out.shift"),
                     score_mult=ensure_i32(get_tensor(f"layers.{i}.attn.score_mult")),
                     score_shift=get_scalar_i8(f"layers.{i}.attn.score_shift", 15),
+                    sink_key=sink_key,
 
                     # FFN
                     up_weight=ensure_i8(get_tensor(f"layers.{i}.ffn.up.weight")),
@@ -422,6 +430,7 @@ class Model:
                     rope_cos=self.rope_cos_lut,
                     rope_sin=self.rope_sin_lut,
                     score_mul_q15=score_mul,
+                    sink_key=layer.sink_key,
                 )
                 attn_outputs.append(head_out)
 

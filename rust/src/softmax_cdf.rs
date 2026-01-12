@@ -5,7 +5,7 @@
 //! Matches CUDA softmax_cumfreq.cu exactly (softmax_cumfreq_i32_u32_kernel).
 
 use crate::lut::Exp2LutQ16;
-use crate::primitives::{argmax_deterministic, round_ties_to_even_host};
+use crate::primitives::argmax_deterministic;
 
 /// Arithmetic coder constants
 pub const NUM_STATE_BITS: u32 = 32;
@@ -22,7 +22,9 @@ pub const W_CLIP: f64 = 0.1; // Must match lm_head weight clip in model
 /// where W_CLIP = 0.1 is the lm_head weight clip.
 pub fn compute_coef_q24() -> u32 {
     let coef_d = (W_CLIP * LOG2E) / 64.0;
-    round_ties_to_even_host(coef_d * (1u64 << 24) as f64).clamp(1, u32::MAX as i64) as u32
+    let scaled = coef_d * ((1u32 << 24) as f64);
+    // Result is small positive value, clamp to valid u32 range
+    (scaled.round() as u32).max(1)
 }
 
 /// Legacy function for compatibility - use compute_coef_q24() instead.
@@ -36,8 +38,11 @@ pub fn compute_coef_q24_for_acc(_lm_head_w_clip: f64) -> u32 {
 /// Must be < QUARTER_RANGE and leave room for all frequencies being at least 1.
 pub fn compute_target_total(vocab_size: usize) -> u32 {
     // target_total = QUARTER_RANGE - vocab_size - 1024
-    let target = (QUARTER_RANGE as i64) - (vocab_size as i64) - 1024;
-    target.max(vocab_size as i64 + 1) as u32
+    // QUARTER_RANGE = 2^30 which fits in u32, result always positive
+    let quarter = QUARTER_RANGE as u32;
+    let vs = vocab_size as u32;
+    let target = quarter.saturating_sub(vs).saturating_sub(1024);
+    target.max(vs + 1)
 }
 
 /// Compute exp weight from logit difference using integer LUT.
